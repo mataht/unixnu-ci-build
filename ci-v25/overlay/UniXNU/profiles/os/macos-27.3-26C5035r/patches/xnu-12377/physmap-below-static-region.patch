@@ -1,0 +1,143 @@
+Place the non-monitor 4 KiB physical aperture below the static region so 14..16 GiB windows do not consume kernel_map VA.
+
+sheng BootLog 20261114-03: raising /chosen/darwinboot-memory-size from 6 GiB to 8 GiB pushed static_memory_end up by
++2 GiB when physmap sat behind topOfKernelData, shrinking kernel_map sub-ranges to ~396 MiB (KERN_NO_SPACE e00002bd on
+Adreno 740 16 MiB GMUCTX allocation). Moving [physmap_base, physmap_end) into the reserved TTBR1 space below
+arm_vm_outside_va / gVirtBase leaves static_memory_end at phystokv(topOfKernelData) as on ARM_LARGE_MEMORY, freeing
+~9.6 GiB of kernel_map VA while mapping the full 14 GiB CN window + 840 MiB adopted Bank 0.
+
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2251,22 +2251,46 @@
+ 	static_memory_end = phystokv(args->topOfKernelData);
+ 	physmap_end = physmap_base + real_phys_size;
+ #else
+-	static_memory_end = physmap_base + mem_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE); // worst possible case for block alignment
+-	physmap_end = physmap_base + real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
+ 	arm_vm_outside_init();
+-	if (arm_vm_outside_end != 0) {
+-		/*
+-		 * The aperture's addresses for the memory outside the span: below the static region, 4 GiB and the
+-		 * span's own length (to a whole L1 entry) under it, far above the low globals' alias at the bottom.
+-		 */
++	{
+ 		const vm_map_address_t under = (gVirtBase & ~((vm_map_address_t)ARM_TT_L1_OFFMASK)) - ((vm_map_address_t)4 << 30);
+-		const vm_map_size_t length = arm_vm_outside_end - arm_vm_outside_base;
+ 
+-		arm_vm_outside_va = under - ROUND_L1(length);
+-		arm_vm_outside_va_end = arm_vm_outside_va + length;
+-		if (arm_vm_outside_va < VM_MIN_KERNEL_AND_KEXT_ADDRESS + ((vm_map_address_t)4 << 30) || arm_vm_outside_va >= under) {
+-			panic("%s: no addresses below the static region for the memory outside the span", __func__);
++		if (arm_vm_outside_end != 0) {
++			/*
++			 * The aperture's addresses for the memory outside the span: below the static region, 4 GiB and the
++			 * span's own length (to a whole L1 entry) under it, far above the low globals' alias at the bottom.
++			 */
++			const vm_map_size_t length = arm_vm_outside_end - arm_vm_outside_base;
++
++			arm_vm_outside_va = under - ROUND_L1(length);
++			arm_vm_outside_va_end = arm_vm_outside_va + length;
++			if (arm_vm_outside_va < VM_MIN_KERNEL_AND_KEXT_ADDRESS + ((vm_map_address_t)4 << 30) || arm_vm_outside_va >= under) {
++				panic("%s: no addresses below the static region for the memory outside the span", __func__);
++			}
+ 		}
++
++		/*
++		 * Place the physical aperture below the static region (and below arm_vm_outside_va when present), in the
++		 * [VM_MIN_KERNEL_AND_KEXT_ADDRESS, LOW_GLOBAL_BASE_ADDRESS) range that pmap_virtual_region reserves out of
++		 * kernel_map. Keeping physmap behind topOfKernelData consumed mem_size of the ~3 GiB 4 KiB kernel_map VA
++		 * budget (causing KERN_NO_SPACE at >= 8 GiB on sheng); placing it below gVirtBase leaves static_memory_end
++		 * at topOfKernelData as on ARM_LARGE_MEMORY so a 14..16 GiB window fits alongside ~9.6 GiB of kernel_map VA.
++		 */
++		const vm_map_address_t physmap_ceiling = (arm_vm_outside_end != 0) ? arm_vm_outside_va : under;
++		const vm_map_size_t physmap_span = real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
++		const unsigned long physmap_l1_entries =
++		    (unsigned long)((physmap_span + ARM64_PHYSMAP_SLIDE_RANGE + ARM_TT_L1_OFFMASK) >> ARM_TT_L1_SHIFT);
++		const vm_map_address_t physmap_region_base =
++		    physmap_ceiling - ((vm_map_address_t)physmap_l1_entries << ARM_TT_L1_SHIFT);
++
++		if (physmap_region_base < VM_MIN_KERNEL_AND_KEXT_ADDRESS + ((vm_map_address_t)4 << 30) ||
++		    physmap_region_base >= physmap_ceiling) {
++			panic("%s: no addresses below the static region for physical aperture (%lx)", __func__, mem_size);
++		}
++		physmap_base = physmap_region_base + physmap_slide;
++		physmap_end = physmap_base + physmap_span;
++		assert(ROUND_L1(physmap_end) <= physmap_ceiling);
++		static_memory_end = phystokv(args->topOfKernelData);
+ 	}
+ #endif // ARM_LARGE_MEMORY
+ #endif
+@@ -2361,6 +2385,13 @@
+ 	 *   the rest of the kernel virtual address space
+ 	 */
+ 	init_ptpages(cpu_tte, physmap_base, ROUND_L1(physmap_end), TRUE, ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
++#elif !XNU_MONITOR
++	/*
++	 * Pre-populate L1 table entries covering the separate physical aperture below gVirtBase.
++	 * Align start down to ARM_TT_L1_SIZE so init_ptpages steps on exact L1 boundaries for any physmap_slide.
++	 */
++	init_ptpages(cpu_tte, physmap_base & ~((vm_map_address_t)ARM_TT_L1_OFFMASK), ROUND_L1(physmap_end), TRUE,
++	    ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
+ #endif
+ 
+ 
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2046,6 +2046,27 @@
+ ml_static_takes_static_address(vm_offset_t vaddr, vm_size_t size)
+ {
+ 	return ml_static_in_image_tail(vaddr, size) || arm_vm_static_segment_releasable(vaddr, size);
++}
++
++extern const vm_map_address_t physmap_end;
++extern vm_offset_t static_memory_end;
++
++/*
++ * Valid ranges for ml_static_protect / ml_static_mfree_prepare / ml_static_mfree when physmap_base may lie below
++ * gVirtBase: inside [physmap_base, physmap_end), an explicitly releasable static range (image tail or
++ * kc-segment-release segment), or dynamic early-boot KVA at/above static_memory_end (e.g. trailing vm_pages[] pages).
++ * Non-releasable KC segments in [gVirtBase, static_memory_end) and unmapped gaps below gVirtBase return false.
++ */
++static bool
++ml_static_address_valid(vm_offset_t vaddr, vm_size_t size)
++{
++	if (vaddr >= physmap_base && vaddr < physmap_end && size <= physmap_end - vaddr) {
++		return true;
++	}
++	if (vaddr >= static_memory_end && vaddr <= VM_MAX_KERNEL_ADDRESS && size <= VM_MAX_KERNEL_ADDRESS - vaddr) {
++		return true;
++	}
++	return ml_static_takes_static_address(vaddr, size);
+ }
+ 
+ kern_return_t
+@@ -2076,8 +2097,9 @@
+ 	ppnum_t       ppn;
+ 	kern_return_t result = KERN_SUCCESS;
+ 
+-	if (vaddr < physmap_base && !ml_static_takes_static_address(vaddr, size)) {
+-		panic("ml_static_protect(): %p < %p", (void *) vaddr, (void *) physmap_base);
++	if (!ml_static_address_valid(vaddr, size)) {
++		panic("ml_static_protect(): %p outside valid static/physmap range (physmap %p..%p)",
++		    (void *) vaddr, (void *) physmap_base, (void *) physmap_end);
+ 		return KERN_FAILURE;
+ 	}
+ 
+@@ -2271,7 +2293,7 @@
+ ml_static_mfree_prepare(vm_offset_t vaddr, vm_size_t size)
+ {
+ 	if ((vaddr & PAGE_MASK) != 0 || size < PAGE_SIZE ||
+-	    (vaddr < physmap_base && !ml_static_takes_static_address(vaddr, size))) {
++	    !ml_static_address_valid(vaddr, size)) {
+ 		return false;
+ 	}
+ 	return ml_static_protect(vaddr, trunc_page(size), VM_PROT_READ | VM_PROT_WRITE) == KERN_SUCCESS;
+@@ -2382,7 +2404,7 @@
+ 
+ 
+ 	/* It is acceptable (if bad) to fail to free. */
+-	if (vaddr < physmap_base && !ml_static_takes_static_address(vaddr, size)) {
++	if (!ml_static_address_valid(vaddr, size)) {
+ 		os_atomic_inc(&ml_static_mfree_dropped_calls, relaxed);
+ 		os_atomic_add(&ml_static_mfree_dropped_bytes, (uint64_t)size, relaxed);
+ 		return;
