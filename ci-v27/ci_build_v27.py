@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""GitHub Actions xcode-27 builder for V27 macOS 27.3 (26C5035r) kernel + absentd + devauth.mbn (fast XNU lane).
+
+Runs inside a public GitHub Actions workspace with zero private identifiers in Git:
+  - repo/ci-v27/            (V27 pure-text overlay, Sm8550Platform-2dc650ca, uefi-font, unit tests)
+  - UniXNU/                 (UniXNU/UniXNU @ 519d8024... with submodules)
+  - UniXNU-sheng/           (UniXNU/UniXNU-sheng @ c8f92b20... with submodules)
+
+Secrets required via GitHub Actions encrypted secrets:
+  - ARTIFACT_KEY            (AES-256-CBC PBKDF2 passphrase for output archive)
+  - OWNER_DATA_VOLUME_UUID  (Target Data volume UUID injected into local .config only)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.request
+from pathlib import Path
+
+EXPECTED_DEVAUTH_SHA = "33c6a607b159b824d6b65a61d6693c72afa39dbe7c2b344d574cb197f3750a04"
+EXPECTED_EXEC_ENV_V27 = (
+    b"exec-env=iconservicesagent|iconservicesd|System_Settings|Finder|Dock|ControlCenter|SystemUIServer|"
+    b"loginwindow|Terminal|com.apple.appkit.xpc.openAndSavePanelService|QuickLookUIService|"
+    b"Weather|Stocks|Clock|Home|@appex:FORCE_SOFTWARE_RENDERER=1"
+)
+
+
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run(cmd: list[str | Path], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    str_cmd = [str(c) for c in cmd]
+    print("==>", " ".join(str_cmd), flush=True)
+    subprocess.run(str_cmd, cwd=str(cwd) if cwd else None, env=env, check=True)
+
+
+def main() -> int:
+    ws = Path.cwd().resolve()
+    ci_dir = ws / "repo/ci-v27"
+    unixnu = ws / "UniXNU"
+    sheng = ws / "UniXNU-sheng"
+    sm8550 = ws / "Sm8550Platform-2dc650ca"
+    uefi_font = ws / "uefi-font"
+    shim_bin = ws / "shim-bin"
+    stage_out = ws / "v27-stage-out"
+
+    if not os.environ.get("ARTIFACT_KEY"):
+        raise SystemExit("ARTIFACT_KEY secret is required before building")
+    owner_uuid = os.environ.get("OWNER_DATA_VOLUME_UUID", "").strip().upper()
+    if not re.fullmatch(r"[0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12}", owner_uuid):
+        raise SystemExit("Valid OWNER_DATA_VOLUME_UUID secret is required before building")
+
+    # 1. Set up neutral `whoami` == builder shim + toolchain PATH
+    shim_bin.mkdir(parents=True, exist_ok=True)
+    whoami_sh = shim_bin / "whoami"
+    whoami_sh.write_text("#!/bin/sh\necho builder\n", encoding="utf-8", newline="\n")
+    whoami_sh.chmod(0o755)
+
+    extra_paths = [
+        str(shim_bin),
+        "/opt/homebrew/opt/python@3.13/libexec/bin",
+        "/opt/homebrew/opt/bison/bin",
+        "/opt/homebrew/opt/lld/bin",
+        "/opt/homebrew/opt/llvm/bin",
+        "/opt/homebrew/bin",
+    ]
+    env = dict(os.environ)
+    env.pop("SDKROOT", None)
+    env["PATH"] = ":".join(extra_paths + [env.get("PATH", "")])
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["ZERO_AR_DATE"] = "1"
+
+    who = subprocess.check_output(["whoami"], env=env, text=True).strip()
+    assert who == "builder", f"Expected whoami=='builder', got {who!r}"
+    sdk_ver = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], env=env, text=True).strip()
+    print(f"Verified Xcode macosx SDK version: {sdk_ver}", flush=True)
+
+    # 2. Apply pure-text V27 overlay + Sm8550Platform + uefi-font (runs AFTER submodule pinning)
+    if sm8550.exists():
+        shutil.rmtree(sm8550)
+    shutil.copytree(ci_dir / "Sm8550Platform-2dc650ca", sm8550)
+    if uefi_font.exists():
+        shutil.rmtree(uefi_font)
+    shutil.copytree(ci_dir / "uefi-font", uefi_font)
+
+    manifest = json.loads((ci_dir / "overlay-manifest.json").read_text(encoding="utf-8"))
+    for rel, exp_sha in sorted(manifest["files"].items()):
+        src = ci_dir / "overlay" / rel
+        dst = ws / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        raw = src.read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == exp_sha, f"Overlay source sha mismatch: {rel}"
+        dst.write_bytes(raw)
+        if dst.suffix in (".sh", ".py"):
+            dst.chmod(0o755)
+    policy_blobs = manifest.get("policy_blobs_hex", {})
+    for rel, item in sorted(policy_blobs.items()):
+        raw = bytes.fromhex(item["hex"])
+        assert hashlib.sha256(raw).hexdigest() == item["sha256"], f"Policy blob sha mismatch: {rel}"
+        dst = ws / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(raw)
+    print(f"Applied & verified {len(manifest['files'])} V27 overlay files + {len(policy_blobs)} policy headers", flush=True)
+
+    # 3. Fast-fail host C11 & C++17 unit tests on macOS clang/clang++ (-Wall -Wextra -Werror)
+    nvt_bin = ws / "nvt_touch_core_bin"
+    eeh_bin = ws / "exec_env_host_bin"
+    qtee_bin = ws / "qtee_host_bin"
+    wn_bin = ws / "wn8030_host_bin"
+    bm_bin = ws / "battmgr_host_bin"
+    nvt_obj = ws / "NvtTouchCore_v27_test.o"
+    bm_obj = ws / "ShengBattmgr_v27_test.o"
+    unit_bin = ws / "v27_unit_test_bin"
+
+    run(
+        [
+            "xcrun", "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I", sheng / "drivers/ShengNovatekTouch",
+            sheng / "drivers/ShengNovatekTouch/NvtTouchCore.c",
+            sheng / "drivers/ShengNovatekTouch/Test/touch-core.c",
+            "-lm", "-o", nvt_bin,
+        ],
+        env=env,
+    )
+    run([nvt_bin], env=env)
+
+    run(
+        [
+            "xcrun", "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            sheng / "package/tests/exec_env_host.c",
+            "-o", eeh_bin,
+        ],
+        env=env,
+    )
+    run([eeh_bin], env=env)
+
+    run(
+        [
+            "xcrun", "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I", sheng / "package",
+            sheng / "package/tests/qcom_tee_wire_host.c",
+            sheng / "package/Wn8030.c",
+            "-o", qtee_bin,
+        ],
+        env=env,
+    )
+    run([qtee_bin], env=env)
+
+    run(
+        [
+            "xcrun", "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I", sheng / "package",
+            sheng / "package/Wn8030.c",
+            sheng / "package/tests/wn8030_host.c",
+            "-o", wn_bin,
+        ],
+        env=env,
+    )
+    run([wn_bin], env=env)
+
+    run(
+        [
+            "xcrun", "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I", sheng / "package",
+            sheng / "package/ShengBattmgr.c",
+            sheng / "package/tests/battmgr_host.c",
+            "-o", bm_bin,
+        ],
+        env=env,
+    )
+    run([bm_bin], env=env)
+
+    run(["python3", unixnu / "drivers/AppleKeyStoreState/test_closed_boundary.py"], env=env)
+
+    run(
+        [
+            "xcrun", "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I", sheng / "drivers/ShengNovatekTouch",
+            "-c", sheng / "drivers/ShengNovatekTouch/NvtTouchCore.c",
+            "-o", nvt_obj,
+        ],
+        env=env,
+    )
+    run(
+        [
+            "xcrun", "clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I", sheng / "package",
+            "-c", sheng / "package/ShengBattmgr.c",
+            "-o", bm_obj,
+        ],
+        env=env,
+    )
+    run(
+        [
+            "xcrun", "clang++", "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-I", sheng / "drivers/ShengNovatekTouch",
+            "-I", sheng / "package",
+            "-I", sheng / "drivers/ShengHidInput",
+            "-I", unixnu / "drivers/AdrenoMetal/bridge",
+            ci_dir / "v27_unit_test.cpp",
+            nvt_obj,
+            bm_obj,
+            "-lm", "-o", unit_bin,
+        ],
+        env=env,
+    )
+    run([unit_bin], env=env)
+    for tmp_b in (nvt_bin, eeh_bin, qtee_bin, wn_bin, bm_bin, nvt_obj, bm_obj, unit_bin):
+        tmp_b.unlink(missing_ok=True)
+
+    # 3b. Fetch SHA-256-pinned board firmware (Touch, Keyboard MCU_Upgrade.bin + devauth.mbn, Video)
+    run(["python3", "scripts/extract-files.py"], cwd=sheng, env=env)
+    devauth_src = sheng / ".cache/firmware/qcom/sm8550/sheng/devauth.mbn"
+    assert devauth_src.is_file() and sha256_file(devauth_src) == EXPECTED_DEVAUTH_SHA, (
+        f"Missing or mismatched devauth.mbn at {devauth_src}"
+    )
+
+    # 3c. Pre-stage & verify Ath12kWifi, QcomIris, and QcaBluetooth locked upstream sources
+    wifi_dir = sheng / "drivers/Ath12kWifi"
+    wifi_lock = json.loads((wifi_dir / "tools/source-lock.json").read_text(encoding="utf-8"))
+    (wifi_dir / "deps").mkdir(parents=True, exist_ok=True)
+    wifi_mirrors = {
+        "linux": "https://github.com/gregkh/linux.git",
+        "freebsd": "https://github.com/freebsd/freebsd-src.git",
+    }
+    for dep_name, mirror_url in wifi_mirrors.items():
+        dep_spec = wifi_lock[dep_name]
+        dep_dir = wifi_dir / "deps" / dep_name
+        cur_head = ""
+        if (dep_dir / ".git").exists():
+            cur_head = subprocess.run(["git", "-C", str(dep_dir), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        if cur_head != dep_spec["commit"]:
+            if dep_dir.exists():
+                shutil.rmtree(dep_dir)
+            run(["git", "init", "-q", dep_dir], env=env)
+            run(["git", "-C", dep_dir, "remote", "add", "origin", mirror_url], env=env)
+            run(["git", "-C", dep_dir, "sparse-checkout", "set", "--no-cone", *dep_spec["paths"]], env=env)
+            run(["git", "-C", dep_dir, "fetch", "-q", "--depth=1", "--filter=blob:none", "origin", dep_spec["commit"]], env=env)
+            run(["git", "-C", dep_dir, "checkout", "-q", "--detach", "FETCH_HEAD"], env=env)
+    run(["bash", "tools/fetch-sources.sh"], cwd=wifi_dir, env=env)
+    run(["bash", "tools/prepare.sh"], cwd=wifi_dir, env=env)
+
+    iris_dir = sheng / "drivers/QcomIris"
+    iris_lock = json.loads((iris_dir / "tools/source-lock.json").read_text(encoding="utf-8"))["linux"]
+    for rel_f, exp_digest in iris_lock["files"].items():
+        dst_f = iris_dir / "deps/linux" / rel_f
+        if dst_f.is_file() and sha256_file(dst_f) == exp_digest:
+            continue
+        raw_url = f"https://raw.githubusercontent.com/gregkh/linux/{iris_lock['commit']}/{rel_f}"
+        req = urllib.request.Request(raw_url, headers={"User-Agent": "unixnu-fetch/1"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            f_bytes = resp.read()
+        assert hashlib.sha256(f_bytes).hexdigest() == exp_digest, f"QcomIris sha mismatch: {rel_f}"
+        dst_f.parent.mkdir(parents=True, exist_ok=True)
+        dst_f.write_bytes(f_bytes)
+    run(["python3", "tools/fetch-sources.py", "--offline"], cwd=iris_dir, env=env)
+    run(["python3", "tools/prepare-linux.py"], cwd=sheng / "drivers/QcaBluetooth", env=env)
+
+    # 4. Defconfig + enforce Data volume UUID from secret + pre-validate payload boot_args + tree
+    run(["python3", "./unixnu", "defconfig", "sheng_macos_defconfig", "-D", "../UniXNU-sheng", "--os", "macos-27"], cwd=unixnu, env=env)
+    work_out = unixnu / "out/sheng/macos-27.3-26C5035r/sheng_macos"
+    cfg_path = work_out / ".config"
+    cfg_txt = cfg_path.read_text(encoding="utf-8")
+    target_uuid = f'CONFIG_XNU_OWNER_DATA_VOLUME_UUID="{owner_uuid}"'
+    if "CONFIG_XNU_OWNER_DATA_VOLUME_UUID=" in cfg_txt:
+        cfg_txt = re.sub(r"^CONFIG_XNU_OWNER_DATA_VOLUME_UUID=.*$", target_uuid, cfg_txt, flags=re.M)
+    else:
+        cfg_txt += "\n" + target_uuid + "\n"
+    cfg_path.write_text(cfg_txt, encoding="utf-8", newline="\n")
+    assert target_uuid in cfg_path.read_text(encoding="utf-8")
+
+    sys.path.insert(0, str(unixnu / "scripts"))
+    from unixnu import cli as ux_cli, kernel as ux_kernel, payload as ux_payload  # noqa: E402
+
+    ux_args = ux_cli.parser().parse_args(
+        ["build", "payload", "--os", "macos-27", "-D", str(sheng), "--local-module", f"kit:Sm8550Platform={sm8550}"]
+    )
+    ctx = ux_cli.Context(ux_args)
+    spec = ctx.board["payload"]
+    line = ux_payload.check_args(list(spec.get("kernel_args", [])))
+    boot_args = " ".join([line, *spec.get("install", {}).get("confirm_args", [])])
+    assert "aks-sls=3" not in boot_args, f"aks-sls=3 still present in macos-27 boot_args: {boot_args}"
+    seal_env = dict(env, **ux_kernel.version_env({}, ctx))
+    print(f"Pre-validated payload boot_args ({len(boot_args)} B)", flush=True)
+
+    run(
+        [
+            "python3", "./unixnu", "fetch", "IOHIDFamily", "IOStorageFamily",
+            "-D", "../UniXNU-sheng", "--os", "macos-27",
+            "--local-module", f"kit:Sm8550Platform={sm8550}",
+        ],
+        cwd=unixnu,
+        env=env,
+    )
+    run(
+        [
+            "python3", "./unixnu", "tree",
+            "-D", "../UniXNU-sheng", "--os", "macos-27",
+            "--local-module", f"kit:Sm8550Platform={sm8550}",
+        ],
+        cwd=unixnu,
+        env=env,
+    )
+    tree = work_out / "tree"
+
+    if stage_out.exists():
+        shutil.rmtree(stage_out)
+    (stage_out / "out").mkdir(parents=True, exist_ok=True)
+    devauth_dst = stage_out / "firmware/qcom/sm8550/sheng/devauth.mbn"
+    devauth_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(devauth_src, devauth_dst)
+
+    # 5. Fast-fail userspace build: unixnu-absentd (V27 generic fallback + compiled launchd.plist + -shutdownstall)
+    absentd_stage = stage_out / "absentd"
+    run(["python3", tree / "scripts/absent-service/build.py", absentd_stage, "macos27"], cwd=tree, env=env)
+    absentd_bin = absentd_stage / "bin/unixnu-absentd"
+    assert absentd_bin.is_file()
+    araw = absentd_bin.read_bytes()
+    assert b"-shutdownstall\x00" in araw, "Missing -shutdownstall in unixnu-absentd"
+    assert b"/System/Library/xpc/launchd.plist" in araw, "Missing compiled launchd.plist lookup in unixnu-absentd"
+    assert b"com.apple.lskdd" in araw and b"com.apple.fairplayd" in araw, "Missing lskdd/fairplayd in unixnu-absentd"
+    assert b"com.apple.libquitd" in araw and b"com.apple.spinreporterd" in araw, "Missing libquitd/spinreporterd in unixnu-absentd"
+
+    # 6. Build & prelink XNU + drivers
+    run(
+        [
+            "python3", "./unixnu", "build", "kernel",
+            "-D", "../UniXNU-sheng",
+            "--os", "macos-27",
+            "--local-module", f"kit:Sm8550Platform={sm8550}",
+        ],
+        cwd=unixnu,
+        env=env,
+    )
+
+    # 7. Patch panic screen / entry probe + seal source corecrypto POST HMAC
+    prelinked_kernel = work_out / "kernel/kernel.macho"
+    payload_kernel = stage_out / "out/kernel.macho"
+    shutil.copyfile(prelinked_kernel, payload_kernel)
+
+    probe_env = dict(env, UNIXNU_UEFI=str(uefi_font))
+    run(
+        ["python3", tree / "scripts/patch-xnu-entry-probe.py", payload_kernel, "--panic-screen", "--no-reset"],
+        cwd=tree,
+        env=probe_env,
+    )
+
+    print(f"Sealing kernel.macho with boot_args ({len(boot_args)} B)", flush=True)
+    run(
+        ["python3", tree / "scripts/seal-source-crypto-kernel.py", payload_kernel, "--kernel-args", boot_args],
+        cwd=tree,
+        env=seal_env,
+    )
+    hmac_json = stage_out / "out/kernel.macho.crypto-hmac.json"
+    assert hmac_json.is_file(), "Missing kernel.macho.crypto-hmac.json after sealing"
+
+    # 8. In-flight binary feature & banner verification before packaging
+    kraw = payload_kernel.read_bytes()
+    banners = [m.decode("ascii", "replace") for m in re.findall(rb"Darwin Kernel Version [^\x00\n]{10,160}", kraw)]
+    assert any("; builder:ios-obj/DEVELOPMENT_ARM64_BCM2837" in b for b in banners), f"Missing neutral builder banner: {banners}"
+    assert owner_uuid.encode("ascii") in kraw, "Missing owner Data volume UUID in kernel.macho"
+
+    # Verify V27 cures in kernel.macho
+    assert b"sheng touch: thermal baseline runaway recovered" in kraw, "Missing V27 Novatek thermal runaway recovery"
+    assert EXPECTED_EXEC_ENV_V27 in kraw, "Missing V27 Weather/Stocks/Clock/Home exec-env in kernel.macho"
+    assert b"AboutExtension\x00" in kraw and b"Weather\x00" in kraw, "Missing V27 Weather/AboutExtension GPU gate"
+    assert b"acm_fastsim=1 gpu-pool=0 clpc=1 smc=1 cdsp=0 log-video=1" in kraw, "Missing V27 cdsp=0 in PE_builtin_boot_args"
+    assert b"/private/var/db/com.apple.xpc.launchd/disabled.501.migrated\x00" in kraw, "Missing disabled.501.migrated"
+    assert b"duetexpertd,intelligenceflowd,intelligenceplatformd" in kraw, "Missing AI/Spotlight native_deny_exec"
+    assert b"NativeSandboxGrantRead\x00" in kraw, "Missing ShengBattery NativeSandboxGrantRead"
+
+    # Verify preserved V26..V5 subsystems in kernel.macho
+    assert b"Touchscreen Pointer\x00" in kraw, "Missing Touchscreen Pointer"
+    assert b"PointerAccelerationSupport\x00" not in kraw and b"sheng_touch_mode" not in kraw
+    assert b"/private/var/ngpu/firmware/qcom/sm8550/sheng/devauth.mbn\x00" in kraw, "Missing #145 devauth.mbn path"
+    assert b"KA st=%d err=%d q=%x ta=%x" in kraw, "Missing #145 KA BootLog row"
+    assert b"com.apple.driver.AppleCredentialManager" in kraw, "Missing #318 AppleCredentialManager prelink"
+    assert b"backboardd,WindowServer,corebrightnessd\x00" in kraw, "Missing #146 backlight sandbox grant"
+    assert b"force-brightness-control\x00" in kraw, "Missing #146 force-brightness-control"
+    assert b"AppleRawExternalConnected\x00" in kraw, "Missing #147 AppleRawExternalConnected"
+    assert b"panic-on-log-stall" in kraw, "Missing V23 panic-on-log-stall"
+    assert b"scrubbed unroutable ULA-only IPv6 RA" in kraw, "Missing V22 ULA RA filter"
+
+    unstripped = tree / "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+    nm_out = subprocess.check_output(["llvm-nm", str(unstripped)], env=env, text=True)
+    assert "native_sandbox_read_grant" in nm_out, "Missing native_sandbox_read_grant in XNU IOUserClient"
+    assert "_native_union_covered_volname" in nm_out, "Missing _native_union_covered_volname in XNU"
+    assert "_proc_find_internal" in nm_out or "_proc_ref_nowait" in nm_out, "Missing proc_find_internal/proc_ref_nowait in XNU"
+
+    prelinked_nm = subprocess.check_output(["llvm-nm", str(payload_kernel)], env=env, text=True)
+    assert "_nvt_touch_rebaseline" in prelinked_nm, "Missing _nvt_touch_rebaseline in prelinked kernel"
+    assert "_native_touch_abort_seq" in prelinked_nm, "Missing _native_touch_abort_seq in prelinked kernel"
+    assert "_native_keyboard_last_input_abs" in prelinked_nm, "Missing _native_keyboard_last_input_abs in prelinked kernel"
+    assert "_sheng_devauth_offline_token" in prelinked_nm, "Missing _sheng_devauth_offline_token in prelinked kernel"
+    assert "_native_ufs_rpmb_scsi" in prelinked_nm, "Missing _native_ufs_rpmb_scsi in prelinked kernel"
+    assert "_native_hid_touch_arm_sink" in prelinked_nm, "Missing _native_hid_touch_arm_sink in prelinked kernel"
+
+    absentd_cdhash = re.search(
+        r"^CDHash=([0-9a-f]{40})$",
+        subprocess.run(["codesign", "--display", "--verbose=4", str(absentd_bin)], capture_output=True, text=True, check=True).stderr,
+        re.M,
+    )[1]
+
+    files_to_hash = [
+        payload_kernel,
+        hmac_json,
+        absentd_bin,
+        devauth_dst,
+    ]
+    sums = {}
+    sums_lines = []
+    for fp in files_to_hash:
+        rel = str(fp.relative_to(stage_out)).replace("\\", "/")
+        d = sha256_file(fp)
+        sums[rel] = {"size": fp.stat().st_size, "sha256": d}
+        sums_lines.append(f"{d}  {rel}")
+    (stage_out / "SHA256SUMS").write_text("\n".join(sums_lines) + "\n", encoding="utf-8", newline="\n")
+
+    ci_verify = {
+        "schema": "sheng-ci-stage-v27-verify-v1",
+        "sdk_version": sdk_ver,
+        "kernel_banners": banners,
+        "boot_args": boot_args,
+        "absentd_cdhash": absentd_cdhash,
+        "files": sums,
+    }
+    (stage_out / "ci-verify.json").write_text(json.dumps(ci_verify, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+    tar_plain = ws / "v27-ci-stage.tar.gz"
+    tar_enc = ws / "v27-ci-stage.tar.gz.enc"
+    with tarfile.open(tar_plain, "w:gz") as tf:
+        tf.add(stage_out, arcname="v27-stage")
+    plain_sha = sha256_file(tar_plain)
+    plain_sz = tar_plain.stat().st_size
+
+    run(
+        [
+            "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt",
+            "-pass", "env:ARTIFACT_KEY",
+            "-in", tar_plain,
+            "-out", tar_enc,
+        ],
+        env=env,
+    )
+    tar_plain.unlink()
+    enc_sha = sha256_file(tar_enc)
+    meta = {
+        "plain_tar_bytes": plain_sz,
+        "plain_tar_sha256": plain_sha,
+        "enc_tar_bytes": tar_enc.stat().st_size,
+        "enc_tar_sha256": enc_sha,
+        "kernel_sha256": sums["out/kernel.macho"]["sha256"],
+        "hmac_sha256": sums["out/kernel.macho.crypto-hmac.json"]["sha256"],
+        "absentd_sha256": sums["absentd/bin/unixnu-absentd"]["sha256"],
+        "absentd_cdhash": absentd_cdhash,
+        "devauth_sha256": sums["firmware/qcom/sm8550/sheng/devauth.mbn"]["sha256"],
+    }
+    (ws / "v27-ci-meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8", newline="\n")
+    print("=== V27 CI BUILD & ENCRYPTED ARCHIVE COMPLETE ===", flush=True)
+    print(json.dumps(meta, indent=2), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
