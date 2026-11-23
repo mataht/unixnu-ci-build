@@ -1,0 +1,45 @@
+Adopt Metal plugin's TU_DARWIN_SERVICE_PORT when IOServiceGetMatchingService
+is filtered in WebContent, and export tu_darwin_clean_host_import (method 19).
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 274b047..0929434 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -203,6 +203,12 @@ dw_open_connection(struct tu_instance *instance)
+       open_type = 0;
+    io_service_t service = IOServiceGetMatchingService(
+       kIOMainPortDefault, IOServiceMatching(service_name));
++   if (!service) {
++      const char *port_env = getenv("TU_DARWIN_SERVICE_PORT");
++      const uint32_t port_val = port_env && *port_env ? (uint32_t)strtoul(port_env, NULL, 0) : 0;
++      if (port_val && IOObjectRetain(port_val) == KERN_SUCCESS)
++         service = (io_service_t)port_val;
++   }
+    if (!service)
+       return VK_ERROR_INCOMPATIBLE_DRIVER;
+ 
+@@ -257,6 +263,24 @@ dw_open_connection(struct tu_instance *instance)
+  * device is open or when the driver refuses it (a foreground priority of 3, the disabled level, is not a queue's foreground).
+  */
+ extern "C" __attribute__((visibility("default"))) bool tu_darwin_set_priority(uint32_t foreground, uint32_t background);
++extern "C" __attribute__((visibility("default"))) bool
++tu_darwin_clean_host_import(uint64_t address, uint64_t bytes, uint32_t flags);
++
++extern "C" __attribute__((visibility("default"))) bool
++tu_darwin_clean_host_import(uint64_t address, uint64_t bytes, uint32_t flags)
++{
++   if (!address || (address & 4095))
++      return false;
++   pthread_mutex_lock(&dw.lock);
++   bool ok = false;
++   if (dw.open) {
++      NativeAdrenoAbiBoClean req = {.address = address, .bytes = bytes, .flags = flags, .reserved = 0};
++      ok = dw_call(NativeAdrenoMethodBoClean, &req, sizeof(req), NULL, 0) == KERN_SUCCESS;
++   }
++   pthread_mutex_unlock(&dw.lock);
++   return ok;
++}
++
+ extern "C" __attribute__((visibility("default"))) bool
+ tu_darwin_set_priority(uint32_t foreground, uint32_t background)
+ {
