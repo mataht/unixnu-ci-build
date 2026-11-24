@@ -1,0 +1,99 @@
+name: macos27-v29
+
+on:
+  push:
+    branches:
+      - ci/macos27-v29-01
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos27-v29-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Check out V29 overlay
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          persist-credentials: false
+
+      - name: Check out UniXNU
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: 519d80242a5028ee123447b01bc3b809baed565f
+          path: UniXNU
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check out UniXNU-sheng
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: c8f92b208068eeaa4cd2b0f592671f04ee70076e
+          path: UniXNU-sheng
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Pin driver submodules
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          pins = json.loads(pathlib.Path('repo/ci-v29/overlay-manifest.json').read_text())['submodules']
+          for rel, sha in sorted(pins.items()):
+              cur = subprocess.check_output(['git', '-C', rel, 'rev-parse', 'HEAD'], text=True).strip()
+              if cur != sha:
+                  subprocess.run(['git', '-C', rel, 'fetch', '--depth=1', 'origin', sha], check=True)
+                  subprocess.run(['git', '-C', rel, 'checkout', '-q', '--detach', 'FETCH_HEAD'], check=True)
+              print(f'Pinned {rel} @ {sha[:12]}')
+          PY
+
+      - name: Install shader & Rust 1.98.0 build tools
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install llvm lld glslang shaderc spirv-tools rustup
+          RUSTUP_BIN="/opt/homebrew/opt/rustup/bin/rustup"
+          if [ ! -x "$RUSTUP_BIN" ]; then RUSTUP_BIN="$(command -v rustup)"; fi
+          "$RUSTUP_BIN" toolchain install 1.98.0 --profile minimal --component rust-src
+
+      - name: Restore cached V28 Metal bridge & Mesa/m2v sources
+        id: feeds-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-work
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/gpu-reference
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/m2v-target
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/adreno-metal-bridge
+          key: unixnu-public-v29-gpu-feeds-v1-519d8024-c8f92b20
+          restore-keys: |
+            unixnu-public-v28-gpu-feeds-v1-519d8024-c8f92b20
+            unixnu-public-v28-gpu-feeds-v1-
+
+      - name: Build V29 NativeAdrenoMetal and Shader Cache
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+        run: |
+          python3 repo/ci-v29/ci_build_v29.py
+
+      - name: Upload encrypted V29 stage archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: v29-ci-stage-encrypted
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            v29-ci-stage.tar.gz.enc
+            v29-ci-meta.json

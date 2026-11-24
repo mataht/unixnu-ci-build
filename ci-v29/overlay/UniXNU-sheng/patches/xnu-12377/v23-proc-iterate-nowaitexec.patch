@@ -1,0 +1,79 @@
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 4d8b252..8ae5ac3 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -1069,7 +1069,8 @@ proc_ref_impl(proc_t p, bool wait, bool locked)
+ 		if (wait) {
+ 			return proc_ref_wait_for_exec(p, bits, locked);
+ 		} else {
+-			/* can't wait - just return null */
++			/* release the fast ref acquired by proc_ref_try_fast before returning null */
++			proc_rele(p);
+ 			return PROC_NULL;
+ 		}
+ 	}
+@@ -2543,8 +2544,8 @@ proc_find_noref_smr(int pid)
+ 	return smr_hash_entered_find(&pid_hash, key, &pid_hash_traits);
+ }
+ 
+-proc_t
+-proc_find(int pid)
++static proc_t
++proc_find_internal(int pid, bool wait_exec)
+ {
+ 	smrh_key_t key = SMRH_SCALAR_KEY(pid);
+ 	proc_t p;
+@@ -2554,7 +2555,7 @@ proc_find(int pid)
+ 	LCK_MTX_ASSERT(&proc_list_mlock, LCK_MTX_ASSERT_NOTOWNED);
+ 
+ 	if (!pid) {
+-		return proc_ref(kernproc, false);
++		return wait_exec ? proc_ref(kernproc, false) : proc_ref_nowait(kernproc);
+ 	}
+ 
+ retry:
+@@ -2583,6 +2584,10 @@ retry:
+ 	}
+ 
+ 	if (__improbable(proc_ref_needs_wait_for_exec(bits))) {
++		if (!wait_exec) {
++			proc_rele(p);
++			return PROC_NULL;
++		}
+ 		p = proc_ref_wait_for_exec(p, bits, false);
+ 		/*
+ 		 * Retry if exec was successful since the old proc
+@@ -2600,6 +2605,12 @@ retry:
+ 	return p;
+ }
+ 
++proc_t
++proc_find(int pid)
++{
++	return proc_find_internal(pid, true);
++}
++
+ proc_t
+ proc_find_locked(int pid)
+ {
+@@ -4296,7 +4307,7 @@ proc_iterate(
+ 	SLIST_FOREACH(pe, &(pl->pl_head), pe_link) {
+ 		for (u_int i = 0; i < pe->pe_nused; i++) {
+ 			const pid_t pid = pe->pe_pid[i];
+-			proc_t p = proc_find(pid);
++			proc_t p = proc_find_internal(pid, (flags & PROC_NOWAITEXEC) == 0);
+ 			if (p) {
+ 				if ((flags & PROC_NOWAITTRANS) == 0) {
+ 					proc_transwait(p, 0);
+diff --git a/bsd/sys/proc_internal.h b/bsd/sys/proc_internal.h
+index 22a54a7..f505b2f 100644
+--- a/bsd/sys/proc_internal.h
++++ b/bsd/sys/proc_internal.h
+@@ -1100,6 +1100,7 @@ extern void pgrp_iterate(struct pgrp *pgrp, proc_iterate_fn_t callout,
+ #define PROC_ALLPROCLIST  (1U << 0) /* walk the allproc list (processes not yet exited) */
+ #define PROC_ZOMBPROCLIST (1U << 1) /* walk the zombie list */
+ #define PROC_NOWAITTRANS  (1U << 2) /* do not wait for transitions (checkdirs only) */
++#define PROC_NOWAITEXEC   (1U << 3) /* do not wait in proc_ref_wait_for_exec (proc_iterate) */
+ 
+ extern void proc_iterate(unsigned int flags, proc_iterate_fn_t callout,
+     void *arg, proc_iterate_fn_t filterfn, void *filterarg);
