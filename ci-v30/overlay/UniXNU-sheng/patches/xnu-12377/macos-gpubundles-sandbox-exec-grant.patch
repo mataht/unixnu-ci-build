@@ -1,0 +1,608 @@
+Grant sandboxed GPU clients (com.apple.WebKit.GPU, WebContent, replayd) read-only and
+executable mmap access to /Library/GPUBundles/NativeAdrenoMetal.*, exempt read-only CTL_HW
+HW_MEMSIZE/CPU sysctls for WebKit.GPU, honor '*' wildcard in NativeSandboxGrantProcess,
+and stand in unixnu-absentd via basename + full-path native_deny_exec for unavailable
+coprocessor and background CPU-hog daemons.
+
+diff --git a/bsd/kern/appsync_trust.inc b/bsd/kern/appsync_trust.inc
+index bb89b9f..fcc2f5d 100644
+--- a/bsd/kern/appsync_trust.inc
++++ b/bsd/kern/appsync_trust.inc
+@@ -4,9 +4,47 @@
+ static bool
+ appsync_user_code_path(const char *path)
+ {
+-	if (path == NULL) {
++	if (path == NULL || path[0] != '/') {
+ 		return false;
+ 	}
++	const size_t full_len = strlen(path);
++	if (strnstr(path, "/../", full_len) || strnstr(path, "/./", full_len) ||
++	    (full_len >= 3 && memcmp(path + full_len - 3, "/..", 3) == 0) ||
++	    (full_len >= 2 && memcmp(path + full_len - 2, "/.", 2) == 0)) {
++		return false;
++	}
++#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
++	const char *p = path;
++	if (strncmp(p, "/System/Volumes/Data/", 21) == 0) {
++		p += 20;
++	}
++	if (strncmp(p, "/System/", 8) == 0 ||
++	    strncmp(p, "/private/var/ngpu/", 18) == 0 ||
++	    strncmp(p, "/var/ngpu/", 10) == 0 ||
++	    strncmp(p, "/private/var/db/", 16) == 0 ||
++	    strncmp(p, "/var/db/", 8) == 0 ||
++	    strncmp(p, "/Library/GPUBundles/", 20) == 0 ||
++	    strncmp(p, "/Applications/Shader Cache.app/", 31) == 0) {
++		return false;
++	}
++	if (strncmp(p, "/Applications/", 14) == 0 ||
++	    strncmp(p, "/Users/", 7) == 0 ||
++	    strncmp(p, "/opt/", 5) == 0 ||
++	    strncmp(p, "/usr/local/", 11) == 0 ||
++	    strncmp(p, "/Library/Application Support/", 29) == 0 ||
++	    strncmp(p, "/Library/PrivilegedHelperTools/", 31) == 0 ||
++	    strncmp(p, "/Library/Caches/", 16) == 0 ||
++	    strncmp(p, "/Library/Frameworks/", 20) == 0 ||
++	    strncmp(p, "/private/tmp/", 13) == 0 ||
++	    strncmp(p, "/tmp/", 5) == 0 ||
++	    strncmp(p, "/private/var/folders/", 21) == 0 ||
++	    strncmp(p, "/var/folders/", 13) == 0 ||
++	    strncmp(p, "/private/var/tmp/", 17) == 0 ||
++	    strncmp(p, "/var/tmp/", 9) == 0 ||
++	    strncmp(p, "/Volumes/", 9) == 0) {
++		return true;
++	}
++#endif
+ 	const char *part;
+ 	if (strncmp(path, "/private/var/", 13) == 0) {
+ 		part = path + 13;
+@@ -15,9 +53,6 @@ appsync_user_code_path(const char *path)
+ 	} else {
+ 		return false;
+ 	}
+-	if (strnstr(part, "/../", strlen(part)) || strnstr(part, "/./", strlen(part))) {
+-		return false;
+-	}
+ 	const char *end;
+ 	while ((end = strchr(part, '/')) != NULL) {
+ 		if (end - part > 4 && memcmp(end - 4, ".app", 4) == 0 && end[1]) {
+@@ -28,10 +63,58 @@ appsync_user_code_path(const char *path)
+ 	return false;
+ }
+ 
+-/* True when appsync is enabled and path is a user application .app under /var.
+- * Used to keep such apps from being treated as platform binaries: they are
+- * trust-cached only so their ad-hoc signature validates, exactly as a real
+- * third-party app would run. */
++#define APPSYNC_CDHASH_SLOTS 16384u
++struct appsync_cdhash_slot {
++	uint8_t used;
++	uint8_t cdhash[20];
++};
++static struct appsync_cdhash_slot *appsync_inserted_slots;
++
++static void
++appsync_record_inserted_locked(const uint8_t cdhash[20])
++{
++	if (appsync_inserted_slots == NULL || cdhash == NULL) {
++		return;
++	}
++	uint32_t h = ((uint32_t)cdhash[0] << 24) | ((uint32_t)cdhash[1] << 16) |
++	    ((uint32_t)cdhash[2] << 8) | (uint32_t)cdhash[3];
++	for (uint32_t step = 0; step < APPSYNC_CDHASH_SLOTS; ++step) {
++		struct appsync_cdhash_slot *s = &appsync_inserted_slots[(h + step) & (APPSYNC_CDHASH_SLOTS - 1u)];
++		if (!s->used) {
++			memcpy(s->cdhash, cdhash, 20);
++			s->used = 1;
++			return;
++		}
++		if (memcmp(s->cdhash, cdhash, 20) == 0) {
++			return;
++		}
++	}
++}
++
++bool
++appsync_cdhash_was_inserted(const uint8_t cdhash[20])
++{
++	if (cdhash == NULL || appsync_inserted_slots == NULL) {
++		return false;
++	}
++	bool found = false;
++	lck_rw_lock_shared(&trust_cache_rt_lock);
++	uint32_t h = ((uint32_t)cdhash[0] << 24) | ((uint32_t)cdhash[1] << 16) |
++	    ((uint32_t)cdhash[2] << 8) | (uint32_t)cdhash[3];
++	for (uint32_t step = 0; step < APPSYNC_CDHASH_SLOTS; ++step) {
++		const struct appsync_cdhash_slot *s = &appsync_inserted_slots[(h + step) & (APPSYNC_CDHASH_SLOTS - 1u)];
++		if (!s->used) {
++			break;
++		}
++		if (memcmp(s->cdhash, cdhash, 20) == 0) {
++			found = true;
++			break;
++		}
++	}
++	lck_rw_unlock_shared(&trust_cache_rt_lock);
++	return found;
++}
++
+ bool
+ appsync_is_user_code(const char *path)
+ {
+@@ -54,16 +137,19 @@ appsync_trust_user_code(const char *path, const uint8_t cdhash[20], uint8_t hash
+ 	if (!cdhash || hash_type < 1 || hash_type > 4 || !amfi || !trust_cache_rt) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+-	/* Query first to avoid allocating on repeated exec/mmap. Recheck under the
+-	 * exclusive lock below so racing first mappings cannot insert duplicates. */
+ 	TrustCacheQueryToken_t token = {0};
+ 	if (xnu_query_trust_cache(kTCQueryTypeAll, cdhash, &token) == KERN_SUCCESS) {
+ 		return KERN_SUCCESS;
+ 	}
++	struct appsync_cdhash_slot *new_table = NULL;
++	if (appsync_inserted_slots == NULL) {
++		new_table = kalloc_data(APPSYNC_CDHASH_SLOTS * sizeof(struct appsync_cdhash_slot), Z_WAITOK_ZERO);
++	}
+ 	const size_t size = sizeof(TrustCacheModule2_t) + sizeof(TrustCacheEntry2_t);
+ 	TrustCache_t *cache = kalloc_type(TrustCache_t, Z_WAITOK_ZERO);
+ 	uint8_t *bytes = kalloc_data(size, Z_WAITOK_ZERO);
+ 	if (!cache || !bytes) {
++		if (new_table) kfree_data(new_table, APPSYNC_CDHASH_SLOTS * sizeof(struct appsync_cdhash_slot));
+ 		if (bytes) kfree_data(bytes, size);
+ 		if (cache) kfree_type(TrustCache_t, cache);
+ 		return KERN_RESOURCE_SHORTAGE;
+@@ -81,6 +167,10 @@ appsync_trust_user_code(const char *path, const uint8_t cdhash[20], uint8_t hash
+ 	bool inserted = false;
+ 	kern_return_t result = KERN_FAILURE;
+ 	lck_rw_lock_exclusive(&trust_cache_rt_lock);
++	if (appsync_inserted_slots == NULL && new_table != NULL) {
++		appsync_inserted_slots = new_table;
++		new_table = NULL;
++	}
+ 	TCReturn_t status = amfi->TrustCache.query(trust_cache_rt, kTCQueryTypeAll, cdhash, &token);
+ 	if (status.error == kTCReturnSuccess) {
+ 		result = KERN_SUCCESS;
+@@ -90,13 +180,16 @@ appsync_trust_user_code(const char *path, const uint8_t cdhash[20], uint8_t hash
+ 		if (status.error == kTCReturnSuccess) {
+ 			++user_modules;
+ 			inserted = true;
++			appsync_record_inserted_locked(cdhash);
+ 			result = KERN_SUCCESS;
+ 		}
+ 	} else if (user_modules >= 65536) {
+ 		result = KERN_RESOURCE_SHORTAGE;
+ 	}
+ 	lck_rw_unlock_exclusive(&trust_cache_rt_lock);
+-	/* The runtime owns successfully linked storage for the rest of this boot. */
++	if (new_table) {
++		kfree_data(new_table, APPSYNC_CDHASH_SLOTS * sizeof(struct appsync_cdhash_slot));
++	}
+ 	if (!inserted) {
+ 		kfree_data(bytes, size);
+ 		kfree_type(TrustCache_t, cache);
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index d3a1d96..31087d2 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2123,7 +2123,8 @@ grade:
+ 			char *as_path = kalloc_data(MAXPATHLEN, Z_WAITOK);
+ 			if (as_path != NULL) {
+ 				if (vn_getpath(imgp->ip_vp, as_path, &as_path_len) == 0 &&
+-				    appsync_is_user_code(as_path)) {
++				    appsync_is_user_code(as_path) &&
++				    appsync_vnode_was_inserted(imgp->ip_vp)) {
+ 					load_result.platform_binary = FALSE;
+ 				}
+ 				kfree_data(as_path, MAXPATHLEN);
+@@ -7019,17 +7020,60 @@ exec_extract_strings(struct image_params *imgp)
+ 	 * system daemon, whose launchd job lives on the read-only system volume).
+ 	 */
+ 	{
+-		static char exec_env[256];
++		static char exec_env[512];
+ 		static int exec_env_state; /* 0 unread, 1 none, 2 read */
+ 		if (exec_env_state == 0) {
+-			exec_env_state = PE_parse_boot_arg_str("exec-env", exec_env, sizeof(exec_env)) ? 2 : 1;
++			if (PE_parse_boot_arg_str("exec-env", exec_env, sizeof(exec_env)) && strchr(exec_env, ':') != NULL) {
++				exec_env_state = 2;
++			} else {
++				uint32_t rb_metal = 0;
++				PE_parse_boot_argn("iconservices-rb-metal", &rb_metal, sizeof(rb_metal));
++				if (rb_metal != 1) {
++					strlcpy(exec_env, "iconservicesagent|iconservicesd|System_Settings|Finder|Dock|ControlCenter|SystemUIServer|loginwindow|Terminal|com.apple.appkit.xpc.openAndSavePanelService|QuickLookUIService|@appex:FORCE_SOFTWARE_RENDERER=1", sizeof(exec_env));
++					exec_env_state = 2;
++				} else {
++					exec_env_state = 1;
++				}
++			}
+ 		}
+ 		const char *colon = exec_env_state == 2 ? strchr(exec_env, ':') : NULL;
+ 		const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++		const size_t path_len = strlen(path);
+ 		const char *base = strrchr(path, '/');
+ 		base = base ? base + 1 : path;
+-		if (colon && strlen(base) == (size_t)(colon - exec_env) &&
+-		    strncmp(base, exec_env, colon - exec_env) == 0) {
++		const size_t base_len = strlen(base);
++		bool exec_env_match = false;
++		if (colon != NULL) {
++			for (const char *tok = exec_env; tok < colon;) {
++				const char *bar = tok;
++				while (bar < colon && *bar != '|') {
++					bar++;
++				}
++				const size_t tlen = (size_t)(bar - tok);
++				if (tlen == 6 && strncmp(tok, "@appex", 6) == 0) {
++					if (strnstr(path, ".appex/Contents/MacOS/", path_len) != NULL ||
++					    strncmp(path, "/System/Library/ExtensionKit/Extensions/", 40) == 0 ||
++					    strncmp(path, "/System/Cryptexes/OS/System/Library/ExtensionKit/Extensions/", 60) == 0) {
++						exec_env_match = true;
++						break;
++					}
++				} else if (tlen > 0 && base_len == tlen) {
++					bool eq = true;
++					for (size_t ci = 0; ci < tlen; ++ci) {
++						if (tok[ci] == '_' ? (base[ci] != '_' && base[ci] != ' ') : (base[ci] != tok[ci])) {
++							eq = false;
++							break;
++						}
++					}
++					if (eq) {
++						exec_env_match = true;
++						break;
++					}
++				}
++				tok = bar + (bar < colon && *bar == '|' ? 1 : 0);
++			}
++		}
++		if (exec_env_match) {
+ 			for (const char *item = colon + 1; *item != '\0';) {
+ 				const char *end = strchr(item, ',');
+ 				size_t len = end ? (size_t)(end - item) : strlen(item);
+@@ -7565,7 +7609,12 @@ bad:
+  * (-[MobileActivationMacOS getUCRTDEPEnrollmentState:]) and the login stopped in MCXMechanism:login (macOS run41/run42). Without
+  * the stand-in the exec fails with EPERM as before.
+  */
+-static TUNABLE_STR(native_deny_exec, 256, "deny-exec", "/usr/libexec/mobileactivationd,/usr/libexec/cryptexd");
++static TUNABLE_STR(native_deny_exec, 2048, "deny-exec",
++    "/usr/libexec/mobileactivationd,/usr/libexec/cryptexd,seputil,lskdd,fairplayd,"
++    "modelcatalogd,mediaanalysisd,photoanalysisd,spindump,tailspind,ReportMemoryException,"
++    "duetexpertd,intelligenceflowd,intelligenceplatformd,intelligencecontextd,intelligencetasksd,"
++    "spotlightknowledged,spotlightknowledged.importer,spotlightknowledged.updater,"
++    "siriknowledged,siriinferenced,knowledge-agent,PerfPowerServices,PerfPowerServicesExtended,coreduetd,BackgroundShortcutRunner,STExtractionService.privileged,softwareupdated,mobileassetd,Install-in-Progress,amsengagementd");
+ static bool
+ native_exec_denied(struct vnode *vp)
+ {
+@@ -7576,14 +7625,20 @@ native_exec_denied(struct vnode *vp)
+ 	int len = MAXPATHLEN;
+ 	bool denied = false;
+ 	if (vn_getpath(vp, path, &len) == 0) {
++		const size_t plen = strlen(path);
++		const char *slash = strrchr(path, '/');
++		const char *base = slash ? slash + 1 : path;
++		const size_t blen = strlen(base);
+ 		for (const char *n = native_deny_exec; *n;) {
+ 			size_t l = 0;
+ 			while (n[l] && n[l] != ',') {
+ 				l++;
+ 			}
+-			if (l && strlen(path) == l && strncmp(path, n, l) == 0) {
+-				denied = true;
+-				break;
++			if (l) {
++				if (n[0] == '/' ? (plen == l && strncmp(path, n, l) == 0) : (blen == l && strncmp(base, n, l) == 0)) {
++					denied = true;
++					break;
++				}
+ 			}
+ 			n += l + (n[l] == ',');
+ 		}
+@@ -9679,7 +9734,7 @@ static void native_owner_macos_addon_sbin(proc_t p, user_addr_t scratch);
+ static void
+ native_owner_macos_addon_sbin(proc_t p, user_addr_t scratch)
+ {
+-	static const char *const binds[][2] = {{"/private/var/ngpu/lib", "/usr/lib"}, {"/private/var/ngpu/sbin", "/usr/sbin"}};
++	static const char *const binds[][2] = {{"/private/var/ngpu/lib", "/usr/lib"}, {"/private/var/ngpu/sbin", "/usr/sbin"}, {"/private/var/ngpu/asi", "/System/Library/PrivateFrameworks/AppleSystemInfo.framework/Versions/A/Resources"}};
+ 	int status = 0;
+ 	for (size_t i = 0; i < sizeof(binds) / sizeof(binds[0]); ++i) {
+ 		vnode_t directory = NULLVP;
+diff --git a/bsd/kern/kern_newsysctl.c b/bsd/kern/kern_newsysctl.c
+index 9a6262e..adeb882 100644
+--- a/bsd/kern/kern_newsysctl.c
++++ b/bsd/kern/kern_newsysctl.c
+@@ -1962,8 +1962,15 @@ found:
+ 	 * userspace -- the Metal plugin, its Vulkan bridge and driver -- sizes its mappings by it inside WebKit's GPU process, whose
+ 	 * sandbox refuses the read, and a page size of -1 refused every IOSurface it was to draw into.
+ 	 */
+-	const bool page_size_read = namelen == 2 && name[0] == CTL_HW && name[1] == HW_PAGESIZE && req->newptr == USER_ADDR_NULL;
+-	if (!from_kernel && !page_size_read) {
++	const bool hw_geom_read = req->newptr == USER_ADDR_NULL && (
++	    (namelen == 2 && name[0] == CTL_HW && (name[1] == HW_PAGESIZE || name[1] == HW_MEMSIZE ||
++	    name[1] == HW_NCPU || name[1] == HW_AVAILCPU || name[1] == HW_PHYSMEM || name[1] == HW_CACHELINE)) ||
++	    (namestring != NULL && (strncmp(namestring, "hw.memsize", 10) == 0 ||
++	    strncmp(namestring, "hw.pagesize", 11) == 0 || strncmp(namestring, "hw.ncpu", 7) == 0 ||
++	    strncmp(namestring, "hw.activecpu", 12) == 0 || strncmp(namestring, "hw.logicalcpu", 13) == 0 ||
++	    strncmp(namestring, "hw.physicalcpu", 14) == 0 || strncmp(namestring, "hw.cachelinesize", 16) == 0 ||
++	    strncmp(namestring, "hw.cpufamily", 12) == 0 || strncmp(namestring, "hw.tbfrequency", 14) == 0)));
++	if (!from_kernel && !hw_geom_read) {
+ 		error = mac_system_check_sysctlbyname(kauth_cred_get(),
+ 		    namestring,
+ 		    name,
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index 93b1ec5..fef6fa6 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -4764,6 +4764,20 @@ reconstitute_code_signature(
+ 	return 0;
+ }
+ 
++bool
++appsync_vnode_was_inserted(struct vnode *vp)
++{
++	if (vp == NULL) {
++		return false;
++	}
++	for (struct cs_blob *blob = ubc_get_cs_blobs(vp); blob != NULL; blob = blob->csb_next) {
++		if (appsync_cdhash_was_inserted(blob->csb_cdhash)) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ int
+ ubc_cs_blob_add(
+ 	struct vnode    *vp,
+diff --git a/bsd/sys/trust_caches.h b/bsd/sys/trust_caches.h
+index e30c88b..cd90f98 100644
+--- a/bsd/sys/trust_caches.h
++++ b/bsd/sys/trust_caches.h
+@@ -159,6 +159,11 @@ appsync_trust_user_code(const char *path, const uint8_t cdhash[20], uint8_t hash
+ /* UniXNU: whether a path is an appsync-managed user application (see above). */
+ bool
+ appsync_is_user_code(const char *path);
++bool
++appsync_cdhash_was_inserted(const uint8_t cdhash[20]);
++struct vnode;
++bool
++appsync_vnode_was_inserted(struct vnode *vp);
+ 
+ kern_return_t
+ load_legacy_trust_cache(
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index f256633..f63561c 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4401,6 +4401,9 @@ native_sandbox_grant(IOService * service)
+ 		while (at[length] && at[length] != ',') {
+ 			++length;
+ 		}
++		if (length == 1 && at[0] == '*') {
++			return true;
++		}
+ 		/* A process name holds 16 characters, so a longer entry is compared by its first 16. */
+ 		if (length && 0 == strncmp(name, at, length < sizeof(name) - 1 ? length : sizeof(name) - 1)
+ 		    && (length >= sizeof(name) - 1 || name[length] == 0)) {
+diff --git a/security/mac_file.c b/security/mac_file.c
+index 4019395..ab71795 100644
+--- a/security/mac_file.c
++++ b/security/mac_file.c
+@@ -170,6 +170,23 @@ mac_file_check_library_validation(struct proc *proc,
+  * (defined in <mach/vm_prot.h>). mac_policy.h does not include any header
+  * files, so cannot use the typedef itself.
+  */
++#include <mach/vm_prot.h>
++#ifndef MAP_SHARED
++#define MAP_SHARED 0x0001
++#endif
++extern volatile uint32_t native_gpubundles_mmap_grants;
++extern int native_gpubundles_readonly_vnode(struct vnode *vp);
++int native_gpubundles_fileglob_grant(struct fileglob *fg);
++
++int
++native_gpubundles_fileglob_grant(struct fileglob *fg)
++{
++	if (fg == NULL || FILEGLOB_DTYPE(fg) != DTYPE_VNODE) {
++		return 0;
++	}
++	return native_gpubundles_readonly_vnode((struct vnode *)fg_get_data(fg));
++}
++
+ int
+ mac_file_check_mmap(struct ucred *cred, struct fileglob *fg, int prot,
+     int flags, uint64_t offset, int *maxprot)
+@@ -179,6 +196,13 @@ mac_file_check_mmap(struct ucred *cred, struct fileglob *fg, int prot,
+ 
+ 	maxp = *maxprot;
+ 	MAC_CHECK(file_check_mmap, cred, fg, NULL, prot, flags, offset, &maxp);
++	if (((flags & MAP_SHARED) == 0 || (prot & VM_PROT_WRITE) == 0) &&
++	    (error != 0 || ((*maxprot & VM_PROT_EXECUTE) != 0 && (maxp & VM_PROT_EXECUTE) == 0)) &&
++	    native_gpubundles_fileglob_grant(fg)) {
++		error = 0;
++		maxp = (flags & MAP_SHARED) ? (*maxprot & ~VM_PROT_WRITE) : *maxprot;
++		__atomic_fetch_add(&native_gpubundles_mmap_grants, 1u, __ATOMIC_RELAXED);
++	}
+ 	if ((maxp | *maxprot) != *maxprot) {
+ 		panic("file_check_mmap increased max protections");
+ 	}
+@@ -191,8 +215,13 @@ mac_file_check_mmap_downgrade(struct ucred *cred, struct fileglob *fg,
+     int *prot)
+ {
+ 	int result = *prot;
++	int orig_exec = (*prot) & VM_PROT_EXECUTE;
+ 
+ 	MAC_PERFORM(file_check_mmap_downgrade, cred, fg, NULL, &result);
++	if (orig_exec != 0 && (result & VM_PROT_EXECUTE) == 0 &&
++	    native_gpubundles_fileglob_grant(fg)) {
++		result |= orig_exec;
++	}
+ 
+ 	*prot = result;
+ }
+diff --git a/security/mac_vfs.c b/security/mac_vfs.c
+index 2992727..aaeed77 100644
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -931,6 +931,38 @@ mac_cred_check_label_update_execve(vfs_context_t ctx, struct vnode *vp, off_t of
+ 	return result;
+ }
+ 
++extern volatile uint32_t native_gpubundles_mmap_grants;
++volatile uint32_t native_gpubundles_mmap_grants = 0;
++int native_gpubundles_readonly_vnode(struct vnode *vp);
++
++int
++native_gpubundles_readonly_vnode(struct vnode *vp)
++{
++	char gp_path[256];
++	int gp_len = (int)sizeof(gp_path);
++	enum vtype gp_vt;
++
++	if (vp == NULL) {
++		return 0;
++	}
++	gp_vt = vnode_vtype(vp);
++	if (gp_vt != VREG && gp_vt != VDIR) {
++		return 0;
++	}
++	if (vn_getpath(vp, gp_path, &gp_len) != 0) {
++		return 0;
++	}
++	if (strncmp(gp_path, "/Library/GPUBundles/NativeAdrenoMetal.",
++	    sizeof("/Library/GPUBundles/NativeAdrenoMetal.") - 1) == 0 ||
++	    strncmp(gp_path, "/System/Volumes/Data/Library/GPUBundles/NativeAdrenoMetal.",
++	    sizeof("/System/Volumes/Data/Library/GPUBundles/NativeAdrenoMetal.") - 1) == 0 ||
++	    strcmp(gp_path, "/Library/GPUBundles") == 0 ||
++	    strcmp(gp_path, "/System/Volumes/Data/Library/GPUBundles") == 0) {
++		return 1;
++	}
++	return 0;
++}
++
+ int
+ mac_vnode_check_access(vfs_context_t ctx, struct vnode *vp,
+     int acc_mode)
+@@ -954,6 +986,10 @@ mac_vnode_check_access(vfs_context_t ctx, struct vnode *vp,
+ 	VFS_KERNEL_DEBUG_START1(29, vp);
+ 	MAC_CHECK(vnode_check_access, cred, vp, mac_vnode_label(vp), mask);
+ 	VFS_KERNEL_DEBUG_END1(29, vp);
++	if (error != 0 && (mask & VWRITE) == 0 &&
++	    native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1187,6 +1223,9 @@ mac_vnode_check_getattr(vfs_context_t ctx, struct ucred *file_cred,
+ 	VFS_KERNEL_DEBUG_START1(39, vp);
+ 	MAC_CHECK(vnode_check_getattr, cred, file_cred, vp, mac_vnode_label(vp), va);
+ 	VFS_KERNEL_DEBUG_END1(39, vp);
++	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1210,6 +1249,9 @@ mac_vnode_check_getattrlist(vfs_context_t ctx, struct vnode *vp,
+ 	VFS_KERNEL_DEBUG_START1(40, vp);
+ 	MAC_CHECK(vnode_check_getattrlist, cred, vp, mac_vnode_label(vp), alist, options);
+ 	VFS_KERNEL_DEBUG_END1(40, vp);
++	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 
+ 	/* Falsify results instead of returning error? */
+ 	return error;
+@@ -1309,6 +1351,9 @@ mac_vnode_check_fsgetpath(vfs_context_t ctx, struct vnode *vp)
+ 	VFS_KERNEL_DEBUG_START1(42, vp);
+ 	MAC_CHECK(vnode_check_fsgetpath, cred, vp, mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(42, vp);
++	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1488,6 +1533,9 @@ mac_vnode_check_getextattr(vfs_context_t ctx, struct vnode *vp,
+ 	MAC_CHECK(vnode_check_getextattr, cred, vp, mac_vnode_label(vp),
+ 	    name, uio);
+ 	VFS_KERNEL_DEBUG_END1(45, vp);
++	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1608,6 +1656,10 @@ mac_vnode_check_lookup_preflight(vfs_context_t ctx, struct vnode *dvp,
+ 	 */
+ 	MAC_CHECK(vnode_check_lookup_preflight, cred, dvp, mac_vnode_label(dvp), path, pathlen, 0);
+ 	VFS_KERNEL_DEBUG_END1(50, dvp);
++	if (error != 0 && ((path != NULL && strncmp(path, "/Library/GPUBundles", 19) == 0) ||
++	    native_gpubundles_readonly_vnode(dvp))) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1631,6 +1683,9 @@ mac_vnode_check_lookup_postflight(vfs_context_t ctx, struct vnode *vp,
+ 	VFS_KERNEL_DEBUG_START1(108, vp);
+ 	MAC_CHECK(vnode_check_lookup_postflight, cred, vp, mac_vnode_label(vp), resolve_flags);
+ 	VFS_KERNEL_DEBUG_END1(108, vp);
++	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1654,6 +1709,9 @@ mac_vnode_check_lookup(vfs_context_t ctx, struct vnode *dvp,
+ 	VFS_KERNEL_DEBUG_START1(51, dvp);
+ 	MAC_CHECK(vnode_check_lookup, cred, dvp, mac_vnode_label(dvp), cnp);
+ 	VFS_KERNEL_DEBUG_END1(51, dvp);
++	if (error != 0 && native_gpubundles_readonly_vnode(dvp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1676,6 +1734,10 @@ mac_vnode_check_open(vfs_context_t ctx, struct vnode *vp, int acc_mode)
+ 	VFS_KERNEL_DEBUG_START1(52, vp);
+ 	MAC_CHECK(vnode_check_open, cred, vp, mac_vnode_label(vp), acc_mode);
+ 	VFS_KERNEL_DEBUG_END1(52, vp);
++	if (error != 0 && (acc_mode & (FWRITE | O_TRUNC | O_APPEND)) == 0 &&
++	    native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1700,6 +1762,9 @@ mac_vnode_check_read(vfs_context_t ctx, struct ucred *file_cred,
+ 	MAC_CHECK(vnode_check_read, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(53, vp);
++	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 
+ 	return error;
+ }
+@@ -1723,6 +1788,9 @@ mac_vnode_check_readdir(vfs_context_t ctx, struct vnode *dvp)
+ 	VFS_KERNEL_DEBUG_START1(54, dvp);
+ 	MAC_CHECK(vnode_check_readdir, cred, dvp, mac_vnode_label(dvp));
+ 	VFS_KERNEL_DEBUG_END1(54, dvp);
++	if (error != 0 && native_gpubundles_readonly_vnode(dvp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -2061,6 +2129,9 @@ mac_vnode_check_stat(vfs_context_t ctx, struct ucred *file_cred,
+ 	MAC_CHECK(vnode_check_stat, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(68, vp);
++	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 

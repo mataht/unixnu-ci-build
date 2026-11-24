@@ -1,0 +1,154 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index d684250..7c763b5 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -65,7 +65,7 @@ struct darwin_retired_bo {
+    uint64_t handle, iova, size;
+    void *mapping;
+    uint32_t token, fence;
+-   bool cacheable, read_only;
++   bool cacheable, read_only, pending_submit;
+ };
+ 
+ /* A freed BO whose fence completed stays whole (kernel handle, GPU mapping, CPU lease) in a size-class cache and is handed to the next
+@@ -126,7 +126,7 @@ struct darwin_retire_state {
+    struct darwin_cached_bo *cache;
+    unsigned cache_count, cache_capacity;
+    uint64_t cache_bytes, cache_stamp, cache_cleaned_s;
+-   uint32_t pressure_seen;
++   uint32_t pressure_seen, active_submits;
+    struct darwin_bo_cache_stats cache_stats;
+ };
+ static struct darwin_retire_state *darwin_stats_state;   /* for tu_darwin_bo_cache_stats */
+@@ -755,6 +755,11 @@ darwin_reap_locked(struct tu_device *dev, struct darwin_retire_state *retire)
+ {
+    if (retire->failure != VK_SUCCESS)
+       return retire->failure;
++   /* Never release or recycle a retired BO while a queue submission is building or splitting chunks on this device:
++    * between chunk 1 (updating dw.last_fence) and chunk 2, or from another thread sharing the VkDevice, a BO whose
++    * earlier fence already completed could otherwise be freed before chunk 2 submits. */
++   if (retire->active_submits != 0)
++      return VK_SUCCESS;
+    /* Cache only within this sweep. Persisting a bare 32-bit fence across sweeps
+     * could mistake a later wrapped value for an old observed completion. */
+    uint32_t completed_fence = 0, pending_fence = 0;
+@@ -766,7 +771,9 @@ darwin_reap_locked(struct tu_device *dev, struct darwin_retire_state *retire)
+    for (unsigned i = 0; i < total; ++i) {
+       struct darwin_retired_bo *bo = &retire->entries[(retire->head + i) % retire->capacity];
+       bool ready = true;
+-      if (bo->fence) {
++      if (bo->pending_submit) {
++         ready = false;
++      } else if (bo->fence) {
+          if (have_pending_fence && bo->fence == pending_fence) {
+             ready = false;
+          } else if (!have_completed_fence || bo->fence != completed_fence) {
+@@ -1170,7 +1177,8 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       pthread_mutex_unlock(&dw.lock);
+       unsigned slot = (retire->head + retire->count) % retire->capacity;
+       retire->entries[slot] = {bo->darwin_handle, bo->iova, bo->darwin_alloc_size ? bo->darwin_alloc_size : bo->size, bo->map,
+-                               bo->darwin_token, fence, bo->darwin_alloc_size != 0, bo->darwin_read_only};
++                               bo->darwin_token, fence, bo->darwin_alloc_size != 0, bo->darwin_read_only,
++                               retire->active_submits != 0};
+       ++retire->count;
+       ++retire->enqueued;
+       darwin_reap_locked(dev, retire);
+@@ -1192,6 +1200,8 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ struct tu_darwin_queue_submit {
+    struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
+    struct util_dynarray starts;   /* uint32_t: the index in commands where a command buffer that sets up its own state begins */
++   struct util_dynarray bos;      /* struct tu_bo *: retained across multi-chunk submissions until darwin_submit_finish */
++   bool guard_active;
+ };
+ 
+ /* Submissions that took more than one kernel submission: [0] such submissions, [1] cuts made where a command buffer begins, [2] cuts
+@@ -1209,14 +1219,44 @@ tu_darwin_split_stats(uint64_t out[4])
+ static void *
+ darwin_submit_create(struct tu_device *device)
+ {
+-   return vk_zalloc(&device->vk.alloc, sizeof(struct tu_darwin_queue_submit), 8,
+-                    VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)
++      vk_zalloc(&device->vk.alloc, sizeof(struct tu_darwin_queue_submit), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (submit && device->darwin_retire) {
++      struct darwin_retire_state *retire = (struct darwin_retire_state *)device->darwin_retire;
++      pthread_mutex_lock(&retire->lock);
++      ++retire->active_submits;
++      submit->guard_active = true;
++      pthread_mutex_unlock(&retire->lock);
++   }
++   return submit;
+ }
+ 
+ static void
+ darwin_submit_finish(struct tu_device *device, void *_submit)
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   util_dynarray_foreach (&submit->bos, struct tu_bo *, bo)
++      darwin_bo_finish(device, *bo);
++   util_dynarray_fini(&submit->bos);
++   if (submit->guard_active && device->darwin_retire) {
++      struct darwin_retire_state *retire = (struct darwin_retire_state *)device->darwin_retire;
++      pthread_mutex_lock(&retire->lock);
++      pthread_mutex_lock(&dw.lock);
++      const uint32_t latest_fence = dw.last_fence;
++      pthread_mutex_unlock(&dw.lock);
++      if (retire->active_submits > 0 && --retire->active_submits == 0) {
++         for (unsigned i = 0; i < retire->count; ++i) {
++            struct darwin_retired_bo *e = &retire->entries[(retire->head + i) % retire->capacity];
++            if (e->pending_submit) {
++               if (latest_fence)
++                  e->fence = latest_fence;
++               e->pending_submit = false;
++            }
++         }
++      }
++      pthread_mutex_unlock(&retire->lock);
++   }
+    util_dynarray_fini(&submit->commands);
+    util_dynarray_fini(&submit->starts);
+    vk_free(&device->vk.alloc, submit);
+@@ -1234,15 +1274,20 @@ static void
+ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+                           struct tu_cs_entry *entries, unsigned num_entries)
+ {
++   (void)device;
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+-   NativeAdrenoAbiSubmitBuffer *cmds = (NativeAdrenoAbiSubmitBuffer *)
+-      util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, num_entries);
+    for (unsigned i = 0; i < num_entries; i++) {
+-      cmds[i] = (NativeAdrenoAbiSubmitBuffer) {
+-         .handle = entries[i].bo->darwin_handle,
+-         .iova = entries[i].bo->iova + entries[i].offset,
++      struct tu_bo *bo = const_cast<struct tu_bo *>(entries[i].bo);
++      if (!bo || entries[i].size == 0 || (entries[i].size & 3))
++         continue;
++      NativeAdrenoAbiSubmitBuffer cmd = {
++         .handle = bo->darwin_handle,
++         .iova = bo->iova + entries[i].offset,
+          .bytes = entries[i].size,
+       };
++      p_atomic_inc(&bo->refcnt);
++      util_dynarray_append(&submit->commands, cmd);
++      util_dynarray_append(&submit->bos, bo);
+    }
+ }
+ 
+@@ -1502,8 +1547,15 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+          *fence = (uint32_t)reply.fence;
+          return VK_SUCCESS;
+       }
+-      if (kr != kIOReturnBusy)
++      if (kr != kIOReturnBusy) {
++         const NativeAdrenoAbiSubmitBuffer first = count ? entries[0] : (NativeAdrenoAbiSubmitBuffer){};
++         const NativeAdrenoAbiSubmitBuffer last = count ? entries[count - 1] : (NativeAdrenoAbiSubmitBuffer){};
++         mesa_loge("darwin: submit failed kr=0x%x count=%u first=(h=%llx iova=%llx b=%llu) last=(h=%llx iova=%llx b=%llu)",
++                   kr, count, (unsigned long long)first.handle, (unsigned long long)first.iova,
++                   (unsigned long long)first.bytes, (unsigned long long)last.handle,
++                   (unsigned long long)last.iova, (unsigned long long)last.bytes);
+          return vk_device_set_lost(&dev->vk, "submit failed: 0x%x", kr);
++      }
+       rec->busy++;
+ 
+       pthread_mutex_lock(&dw.lock);
