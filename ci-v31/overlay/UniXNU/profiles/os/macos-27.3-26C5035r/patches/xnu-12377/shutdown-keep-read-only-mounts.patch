@@ -1,0 +1,26 @@
+Read-only mounts stay mounted through reboot_kernel's vfs_unmountall passes.
+
+sheng BootLog 20261114-02: a macOS Restart unmounted /, the OS cryptex views and the SystemCryptex volume in the
+non-system pass; a launchd thread then executed shared-cache text whose page could no longer be read (esr 0x82000007),
+SIGBUS killed pid 1 and the kernel panicked (initproc exited). Read-only mounts have nothing to write back.
+
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -4286,7 +4286,16 @@
+ 	mntname = zalloc_flags(ZV_NAMEI, Z_WAITOK | Z_NOFAIL);
+ 	strlcpy(mntname, mp->mnt_vfsstat.f_mntonname, MAXPATHLEN);
+ 
+-	if (uip->u_only_non_system
++	/*
++	 * A read-only mount has nothing to write back. The owner root, the OS and App cryptexes and the GPU bundle views are
++	 * read-only mounts without MNT_ROOTFS or MNTK_SYSTEM, and launchd keeps executing their text (dyld shared cache)
++	 * until the restart: unmounting them made its next page-in fail, SIGBUS killed pid 1 and the kernel panicked with
++	 * "initproc exited" instead of restarting. Both passes leave them mounted.
++	 */
++	if ((mp->mnt_flag & MNT_RDONLY) && !(mp->mnt_flag & MNT_ROOTFS) && !(mp->mnt_kern_flag & MNTK_SYSTEM)) {
++		printf("unmount(%d) %s skipped (read-only)\n", uip->u_only_non_system, mntname);
++		mount_iterdrop(mp);     // VFS_ITERATE_CB_DROPREF
++	} else if (uip->u_only_non_system
+ 	    && ((mp->mnt_flag & MNT_ROOTFS) || (mp->mnt_kern_flag & MNTK_SYSTEM))) { //MNTK_BACKS_ROOT
+ 		printf("unmount(%d) %s skipped\n", uip->u_only_non_system, mntname);
+ 		mount_iterdrop(mp);     // VFS_ITERATE_CB_DROPREF

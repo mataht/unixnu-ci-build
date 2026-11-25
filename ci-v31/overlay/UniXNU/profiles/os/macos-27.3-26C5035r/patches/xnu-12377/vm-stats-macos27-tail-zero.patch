@@ -1,0 +1,45 @@
+Zero trailing macOS 27 vm_statistics64 words in vm_stats() when *count > HOST_VM_INFO64_COUNT.
+
+sheng BootLog 20261115-03: macOS 27.3 (26C5035r) sysmond and PerfPowerServices pass count=104 (> xnu-12377's
+HOST_VM_INFO64_COUNT=62), spamming vm_log_error and leaving trailing words [62..103] uninitialized across MIG
+CountInOut replies. Zero-fill trailing words up to HOST_INFO_MAX and preserve bounded revision counts (<= 128).
+
+--- a/osfmk/kern/host.c
++++ b/osfmk/kern/host.c
+@@ -829,13 +829,18 @@
+ 	natural_t throttled_count = vm_page_throttled_count;
+ 
+ 	if (*count > HOST_VM_INFO64_COUNT) {
+-		vm_log_error("host_statistics64() count is larger than expected "
+-		    "(actual:%u > HOST_VM_INFO64_COUNT:%u). This is most likely a bug in "
+-		    "%s [%d] and is likely to result in memory corruption. The buffer count "
+-		    "must be passed in units of integer_t's. HOST_VM_INFO64_COUNT may be "
+-		    "used as shorthand.\n",
+-		    *count, HOST_VM_INFO64_COUNT,
+-		    task_best_name(current_task()), task_pid(current_task()));
++		/*
++		 * macOS 27 userspace (e.g. sysmond, PerfPowerServices) passes an expanded
++		 * vm_statistics64_data_t count (104 integer_t's > xnu-12377's 62). Zero
++		 * the trailing words inside the MIG host_info_data_t[HOST_INFO_MAX] buffer
++		 * and, for genuine struct-revision counts (<= 128, well below byte-size
++		 * bugs >= sizeof(vm_statistics64_data_t) == 248), return the zero-extended
++		 * count so MIG copies zeroes over the caller's trailing fields without
++		 * console/msgbuf error spam or uninitialized userspace stack reads.
++		 */
++		unsigned int zero_end = *count <= HOST_INFO_MAX ? *count : HOST_INFO_MAX;
++		bzero((integer_t *)info + HOST_VM_INFO64_COUNT,
++		    (zero_end - HOST_VM_INFO64_COUNT) * sizeof(integer_t));
+ 		DTRACE_VM2(vm_stats_bad_count,
+ 		    uint, *count,
+ 		    uint, HOST_VM_INFO64_COUNT);
+@@ -964,7 +969,9 @@
+ 	stat->total_tagged_pages = 0;
+ #endif /* HAS_MTE */
+ 
+-	*count = HOST_VM_INFO64_REV3_COUNT;
++	*count = (original_count > HOST_VM_INFO64_REV3_COUNT && original_count <= 128)
++	    ? original_count
++	    : HOST_VM_INFO64_REV3_COUNT;
+ 	return KERN_SUCCESS;
+ }
+ 
