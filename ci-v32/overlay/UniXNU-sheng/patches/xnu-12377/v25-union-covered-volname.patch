@@ -1,0 +1,138 @@
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+index 9ce025a..4762d3c 100644
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -244,6 +244,9 @@ extern mount_t native_union_identity(mount_t mp);
+  * The union that stands in for the volume of the object being packed (native_union_identity), or NULL: from the mount the file
+  * system gave, the vnode, or for an entry of a bulk enumeration packed without either, the directory's mount.
+  */
++extern mount_t native_union_covered_root(mount_t mp);
++extern bool native_union_covered_volname(mount_t mp, vfs_context_t ctx, char *buf, size_t len);
++
+ static mount_t
+ native_union_pack_top(mount_t mp, vnode_t vp)
+ {
+@@ -1018,6 +1021,9 @@ getvolattrlist(vfs_context_t ctx, vnode_t vp, struct attrlist *alp,
+ 	const char      *cnp = NULL;    /* protected by ATTR_CMN_NAME */
+ 	ssize_t         cnl = 0;        /* protected by ATTR_CMN_NAME */
+ 	int             release_str = 0;
++#if XNU_TARGET_OS_OSX
++	char            *covered_volname = NULL;
++#endif
+ 	mount_t         mnt;
+ 	int             return_valid;
+ 	int             pack_invalid;
+@@ -1134,6 +1140,12 @@ getvolattrlist(vfs_context_t ctx, vnode_t vp, struct attrlist *alp,
+ 			VFS_DEBUG(ctx, vp, "ATTRLIST - ERROR: MAC framework returned %d", error);
+ 			goto out;
+ 		}
++#endif
++#if XNU_TARGET_OS_OSX
++		if (VFSATTR_IS_ACTIVE(&vs, f_vol_name) && vs.f_vol_name != NULL &&
++		    native_union_covered_volname(mnt, ctx, vs.f_vol_name, MAXPATHLEN)) {
++			VFSATTR_SET_SUPPORTED(&vs, f_vol_name);
++		}
+ #endif
+ 		/*
+ 		 * Did we ask for something the filesystem doesn't support?
+@@ -1274,12 +1286,23 @@ getvolattrlist(vfs_context_t ctx, vnode_t vp, struct attrlist *alp,
+ 			 * pre Tiger code.  returning nothing for the boot volume name
+ 			 * breaks installers - 3961058
+ 			 */
+-			cnp = vnode_getname(vp);
+-			if (cnp == NULL) {
+-				/* just use "/" as name */
+-				cnp = &vp->v_mount->mnt_vfsstat.f_mntonname[0];
+-			} else {
+-				release_str = 1;
++#if XNU_TARGET_OS_OSX
++			if (native_union_covered_root(mnt) != NULL) {
++				covered_volname = (char *)zalloc(ZV_NAMEI);
++				if (native_union_covered_volname(mnt, ctx, covered_volname, MAXPATHLEN)) {
++					cnp = covered_volname;
++				}
++			}
++			if (cnp == NULL)
++#endif
++			{
++				cnp = vnode_getname(vp);
++				if (cnp == NULL) {
++					/* just use "/" as name */
++					cnp = &vp->v_mount->mnt_vfsstat.f_mntonname[0];
++				} else {
++					release_str = 1;
++				}
+ 			}
+ 			cnl = strlen(cnp);
+ 		} else {
+@@ -1746,6 +1769,11 @@ out:
+ 	if (vs.f_vol_name != NULL) {
+ 		zfree(ZV_NAMEI, vs.f_vol_name);
+ 	}
++#if XNU_TARGET_OS_OSX
++	if (covered_volname != NULL) {
++		zfree(ZV_NAMEI, covered_volname);
++	}
++#endif
+ 	if (release_str) {
+ 		vnode_putname(cnp);
+ 	}
+@@ -3533,6 +3561,12 @@ getattrlist_internal(vfs_context_t ctx, vnode_t vp, struct attrlist  *alp,
+ #else
+ 		(void)file_cred;
+ #endif
++#if XNU_TARGET_OS_OSX
++		if (!authoritative_name && va_name != NULL && vnode_isvroot(vp) &&
++		    native_union_covered_volname(vp->v_mount, ctx, va_name, MAXPATHLEN)) {
++			VATTR_SET_SUPPORTED(va, va_name);
++		}
++#endif
+ 
+ 		/*
+ 		 * It we ask for the name, i.e., vname is non null and
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index abbd26a..e0e80c3 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -13552,6 +13552,41 @@ native_union_identity(mount_t mp)
+ 	}
+ 	return mp;
+ }
++
++mount_t
++native_union_covered_root(mount_t mp)
++{
++	mount_t top = rootvnode != NULLVP ? rootvnode->v_mount : NULL;
++	if (mp != NULL && mp == top && (top->mnt_flag & MNT_UNION) &&
++	    top->mnt_vnodecovered != NULLVP) {
++		mount_t covered = top->mnt_vnodecovered->v_mount;
++		if (covered != NULL && covered != top && (covered->mnt_flag & MNT_ROOTFS)) {
++			return covered;
++		}
++	}
++	return NULL;
++}
++
++bool
++native_union_covered_volname(mount_t mp, vfs_context_t ctx, char *buf, size_t len)
++{
++	mount_t covered = native_union_covered_root(mp);
++	if (covered == NULL || buf == NULL || len == 0) {
++		return false;
++	}
++	struct vfs_attr cvs;
++	VFSATTR_INIT(&cvs);
++	VFSATTR_WANTED(&cvs, f_vol_name);
++	cvs.f_vol_name = (char *)zalloc(ZV_NAMEI);
++	cvs.f_vol_name[0] = '\0';
++	bool ok = (vfs_getattr(covered, &cvs, ctx) == 0 &&
++	    VFSATTR_IS_SUPPORTED(&cvs, f_vol_name) && cvs.f_vol_name[0] != '\0');
++	if (ok) {
++		strlcpy(buf, cvs.f_vol_name, len);
++	}
++	zfree(ZV_NAMEI, cvs.f_vol_name);
++	return ok;
++}
+ #endif /* XNU_TARGET_OS_OSX */
+ 
+ /*
