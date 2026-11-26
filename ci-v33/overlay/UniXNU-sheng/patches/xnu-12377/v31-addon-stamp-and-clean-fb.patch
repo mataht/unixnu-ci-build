@@ -1,0 +1,119 @@
+Deduplicate native_gpu_addon_install() across boot callers, skip redundant warm-boot
+decompression/readback via SHA-256 /private/var/ngpu/.addon-stamp while preserving
+native_gpu_addon_release() wired-RAM reclaim, and clear the GOP framebuffer to black
+at XNU kPEGraphicsMode entry using volatile MMIO-safe register stores (never bzero /
+dc zva, which raises Alignment Fault ESR=0x96000061 on ml_io_map_unmappable memory).
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 246de9b..82f219e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8677,6 +8677,10 @@ native_gpu_bundle_protect(const char *path)
+ static void
+ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ {
++	static bool native_gpu_addon_done = false;
++	if (native_gpu_addon_done) {
++		return;
++	}
+ 	const uint8_t *addon = NULL;
+ 	uint64_t bytes = 0;
+ 	if (!native_ram_block_gpu_addon || !native_ram_block_gpu_addon(&addon, &bytes)) {
+@@ -8727,6 +8731,53 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		native_gpu_addon_error = EINVAL;
+ 		return;
+ 	}
++#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
++	uint8_t addon_stamp[44];
++	{
++		SHA256_CTX sctx;
++		SHA256_Init(&sctx);
++		SHA256_Update(&sctx, addon, (size_t)bytes);
++		SHA256_Final(addon_stamp, &sctx);
++		memcpy(addon_stamp + 32, &bytes, 8);
++		memcpy(addon_stamp + 40, &count, 4);
++	}
++	uint32_t addon_recheck = 0;
++	if (!PE_parse_boot_argn("gpu-addon-recheck", &addon_recheck, sizeof(addon_recheck)) || addon_recheck != 1) {
++		vfs_context_t kctx = vfs_context_kernel();
++		vnode_t svp = NULLVP;
++		if (vnode_open("/private/var/ngpu/.addon-stamp", FREAD | O_NOFOLLOW, 0, 0, &svp, kctx) == 0) {
++			uint8_t on_disk[44] = {0};
++			int sresid = 0;
++			int serr = vn_rdwr(UIO_READ, svp, (caddr_t)on_disk, (int)sizeof(on_disk), 0, UIO_SYSSPACE, IO_NOAUTH,
++			    vfs_context_ucred(kctx), &sresid, vfs_context_proc(kctx));
++			vnode_close(svp, FREAD, kctx);
++			if (!serr && !sresid && memcmp(on_disk, addon_stamp, sizeof(addon_stamp)) == 0) {
++				static const char *const sentinels[] = {
++					"/Library/GPUBundles/NativeAdrenoMetal.bundle/Contents/Info.plist",
++					"/Applications/Shader Cache.app/Contents/MacOS/ShaderCacheWorker",
++					"/private/var/ngpu/bootshim/apfs_boot_util",
++					"/private/var/ngpu/sbin/bluetoothd",
++					"/private/var/ngpu/bin/unixnu-absentd",
++				};
++				bool all_present = true;
++				for (size_t si = 0; si < sizeof(sentinels) / sizeof(sentinels[0]); ++si) {
++					vnode_t pvp = NULLVP;
++					if (vnode_lookup(sentinels[si], 0, &pvp, kctx) != 0) {
++						all_present = false;
++						break;
++					}
++					vnode_put(pvp);
++				}
++				if (all_present) {
++					native_gpu_addon_files = (int)count;
++					native_gpu_addon_same = (int)count;
++					native_gpu_addon_done = true;
++					return;
++				}
++			}
++		}
++	}
++#endif
+ 	native_gpu_addon_files = (int)count;
+ 	vfs_context_t ctx = vfs_context_current();
+ 	char path[192];
+@@ -8784,6 +8835,12 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		}
+ 		at += (packed + 7) & ~7ULL;
+ 	}
++#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
++	if (!native_gpu_addon_failed && !native_gpu_bundle_protect_error) {
++		(void)native_gpu_addon_write("/private/var/ngpu/.addon-stamp", addon_stamp, sizeof(addon_stamp), 0600, vfs_context_kernel());
++	}
++#endif
++	native_gpu_addon_done = true;
+ }
+ /* The OS cryptex where iPadOS looks for it. The root volume's entries for cryptex content are links into /System/Cryptexes/OS, which
+  * leads to /private/preboot/Cryptexes/OS; WebKit's processes are ExtensionKit extensions reached that way
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 15b5964..35f4298 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -2940,6 +2940,26 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ 	case kPEGraphicsMode:
+ 		gc_graphics_boot = TRUE;
+ 		gc_desire_text = FALSE;
++		if (!boot_progress_active() && vinfo.v_baseaddr && vinfo.v_depth == 32 &&
++		    vinfo.v_width && vinfo.v_height && vinfo.v_rowbytes >= vinfo.v_width * 4 &&
++		    ((vinfo.v_baseaddr | vinfo.v_rowbytes) & 3) == 0) {
++			if (((vinfo.v_baseaddr | vinfo.v_rowbytes) & 7) == 0 && (vinfo.v_width & 1) == 0) {
++				const unsigned int pairs = vinfo.v_width >> 1;
++				for (unsigned int y = 0; y < vinfo.v_height; ++y) {
++					volatile uint64_t *row64 = (volatile uint64_t *)(vinfo.v_baseaddr + (uintptr_t)y * vinfo.v_rowbytes);
++					for (unsigned int x = 0; x < pairs; ++x) {
++						row64[x] = 0;
++					}
++				}
++			} else {
++				for (unsigned int y = 0; y < vinfo.v_height; ++y) {
++					volatile uint32_t *row32 = (volatile uint32_t *)(vinfo.v_baseaddr + (uintptr_t)y * vinfo.v_rowbytes);
++					for (unsigned int x = 0; x < vinfo.v_width; ++x) {
++						row32[x] = 0;
++					}
++				}
++			}
++		}
+ 		break;
+ 
+ 	case kPETextMode:

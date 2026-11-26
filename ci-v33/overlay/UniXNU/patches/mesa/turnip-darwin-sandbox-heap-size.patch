@@ -1,0 +1,18 @@
+Ensure Turnip physical device heap size is non-zero when sandboxed Darwin
+clients cannot query physical RAM pages via sysconf(_SC_PHYS_PAGES).
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index b667197..274b047 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1933,6 +1933,10 @@ tu_knl_darwin_load(struct tu_instance *instance)
+    device->sync_types[2] = NULL;
+ 
+    device->heap.size = tu_get_system_heap_size(device);
++   if (!device->heap.size) {
++      const uint64_t fallback_heap = UINT64_C(4) << 30;
++      device->heap.size = device->va_size && device->va_size < fallback_heap ? device->va_size : fallback_heap;
++   }
+    device->heap.used = 0u;
+    device->heap.flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+ 

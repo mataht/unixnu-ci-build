@@ -1,0 +1,444 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 285cb55..ba14908 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7614,7 +7614,7 @@ static TUNABLE_STR(native_deny_exec, 2048, "deny-exec",
+     "modelcatalogd,mediaanalysisd,photoanalysisd,spindump,tailspind,ReportMemoryException,"
+     "duetexpertd,intelligenceflowd,intelligenceplatformd,intelligencecontextd,intelligencetasksd,"
+     "spotlightknowledged,spotlightknowledged.importer,spotlightknowledged.updater,"
+-    "siriknowledged,siriinferenced,knowledge-agent,PerfPowerServices,PerfPowerServicesExtended,coreduetd,BackgroundShortcutRunner,STExtractionService.privileged,softwareupdated,mobileassetd,Install-in-Progress,amsengagementd,SoftwareUpdateNotificationManager,assetsubscriptiond");
++    "siriknowledged,siriinferenced,knowledge-agent,PerfPowerServices,PerfPowerServicesExtended,coreduetd,BackgroundShortcutRunner,STExtractionService.privileged,softwareupdated,mobileassetd,Install-in-Progress,amsengagementd,SoftwareUpdateNotificationManager,assetsubscriptiond,assistantd,assistant_service,audiomxd,SiriTTSTrainingAgent,parsec-fbf");
+ static bool
+ native_exec_denied(struct vnode *vp)
+ {
+diff --git a/bsd/net/ntstat.h b/bsd/net/ntstat.h
+index 96fb469..d0b4d75 100644
+--- a/bsd/net/ntstat.h
++++ b/bsd/net/ntstat.h
+@@ -511,6 +511,9 @@ typedef struct nstat_tcp_descriptor {
+ 	uint32_t        ifnet_properties        __attribute__((aligned(4)));
+ 	uint8_t         fallback_mode;
+ 	uint8_t         reserved[3];
++#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
++	uint8_t         darwin26_pad[16];
++#endif
+ } nstat_tcp_descriptor;
+ 
+ typedef struct nstat_tcp_add_param      nstat_udp_add_param;
+diff --git a/iokit/Kernel/IONVRAMCHRPHandler.cpp b/iokit/Kernel/IONVRAMCHRPHandler.cpp
+index 0cc7f6e..0e41b8f 100644
+--- a/iokit/Kernel/IONVRAMCHRPHandler.cpp
++++ b/iokit/Kernel/IONVRAMCHRPHandler.cpp
+@@ -630,7 +630,11 @@ IONVRAMCHRPHandler::serializeVariables(void)
+ 								{ kIONVRAMPartitionSystem, _systemPartitionOffset, _systemPartitionSize} };
+ 	NVRAMLOCKASSERTHELD(_controllerLock);
+ 
+-	require_action(_nvramController != nullptr, exit, (ret = kIOReturnNotReady, DEBUG_ERROR("No _nvramController\n")));
++	if (_nvramController == nullptr) {
++		_newData = false;
++		ret = kIOReturnSuccess;
++		goto exit;
++	}
+ 	require_action(_newData == true, exit, (ret = kIOReturnSuccess, DEBUG_INFO("No _newData to sync\n")));
+ 	require_action(_bankSize != 0, exit, (ret = kIOReturnSuccess, DEBUG_INFO("No nvram size info\n")));
+ 	require_action(_nvramImage != nullptr, exit, (ret = kIOReturnSuccess, DEBUG_INFO("No nvram image info\n")));
+diff --git a/security/mac_file.c b/security/mac_file.c
+index ab71795..9b74f2b 100644
+--- a/security/mac_file.c
++++ b/security/mac_file.c
+@@ -195,14 +195,15 @@ mac_file_check_mmap(struct ucred *cred, struct fileglob *fg, int prot,
+ 	int maxp;
+ 
+ 	maxp = *maxprot;
+-	MAC_CHECK(file_check_mmap, cred, fg, NULL, prot, flags, offset, &maxp);
+ 	if (((flags & MAP_SHARED) == 0 || (prot & VM_PROT_WRITE) == 0) &&
+-	    (error != 0 || ((*maxprot & VM_PROT_EXECUTE) != 0 && (maxp & VM_PROT_EXECUTE) == 0)) &&
+ 	    native_gpubundles_fileglob_grant(fg)) {
+-		error = 0;
+-		maxp = (flags & MAP_SHARED) ? (*maxprot & ~VM_PROT_WRITE) : *maxprot;
++		if (flags & MAP_SHARED) {
++			*maxprot = maxp & ~VM_PROT_WRITE;
++		}
+ 		__atomic_fetch_add(&native_gpubundles_mmap_grants, 1u, __ATOMIC_RELAXED);
++		return 0;
+ 	}
++	MAC_CHECK(file_check_mmap, cred, fg, NULL, prot, flags, offset, &maxp);
+ 	if ((maxp | *maxprot) != *maxprot) {
+ 		panic("file_check_mmap increased max protections");
+ 	}
+@@ -217,11 +218,10 @@ mac_file_check_mmap_downgrade(struct ucred *cred, struct fileglob *fg,
+ 	int result = *prot;
+ 	int orig_exec = (*prot) & VM_PROT_EXECUTE;
+ 
+-	MAC_PERFORM(file_check_mmap_downgrade, cred, fg, NULL, &result);
+-	if (orig_exec != 0 && (result & VM_PROT_EXECUTE) == 0 &&
+-	    native_gpubundles_fileglob_grant(fg)) {
+-		result |= orig_exec;
++	if (orig_exec != 0 && native_gpubundles_fileglob_grant(fg)) {
++		return;
+ 	}
++	MAC_PERFORM(file_check_mmap_downgrade, cred, fg, NULL, &result);
+ 
+ 	*prot = result;
+ }
+diff --git a/security/mac_vfs.c b/security/mac_vfs.c
+index c62bcd8..d656d8c 100644
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -957,11 +957,15 @@ native_gpubundles_readonly_vnode(struct vnode *vp)
+ 	    strncmp(gp_path, "/private/var/ngpu/GPUBundles/", sizeof("/private/var/ngpu/GPUBundles/") - 1) == 0 ||
+ 	    strncmp(gp_path, "/private/var/tmp/NativeAdrenoMetal.cache/", sizeof("/private/var/tmp/NativeAdrenoMetal.cache/") - 1) == 0 ||
+ 	    strncmp(gp_path, "/System/Volumes/Data/private/var/tmp/NativeAdrenoMetal.cache/", sizeof("/System/Volumes/Data/private/var/tmp/NativeAdrenoMetal.cache/") - 1) == 0 ||
++	    strncmp(gp_path, "/private/var/ngpu/shader-cache/", sizeof("/private/var/ngpu/shader-cache/") - 1) == 0 ||
++	    strncmp(gp_path, "/System/Volumes/Data/private/var/ngpu/shader-cache/", sizeof("/System/Volumes/Data/private/var/ngpu/shader-cache/") - 1) == 0 ||
+ 	    strcmp(gp_path, "/Library/GPUBundles") == 0 ||
+ 	    strcmp(gp_path, "/System/Volumes/Data/Library/GPUBundles") == 0 ||
+ 	    strcmp(gp_path, "/private/var/ngpu/GPUBundles") == 0 ||
+ 	    strcmp(gp_path, "/private/var/tmp/NativeAdrenoMetal.cache") == 0 ||
+-	    strcmp(gp_path, "/System/Volumes/Data/private/var/tmp/NativeAdrenoMetal.cache") == 0) {
++	    strcmp(gp_path, "/System/Volumes/Data/private/var/tmp/NativeAdrenoMetal.cache") == 0 ||
++	    strcmp(gp_path, "/private/var/ngpu/shader-cache") == 0 ||
++	    strcmp(gp_path, "/System/Volumes/Data/private/var/ngpu/shader-cache") == 0) {
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -1010,13 +1014,13 @@ mac_vnode_check_access(vfs_context_t ctx, struct vnode *vp,
+ 	}
+ 	/* Convert {R,W,X}_OK values to V{READ,WRITE,EXEC} for entry points */
+ 	mask = ACCESS_MODE_TO_VNODE_MASK(acc_mode);
++	if (((mask & VWRITE) == 0 && native_gpubundles_readonly_vnode(vp)) ||
++	    native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(29, vp);
+ 	MAC_CHECK(vnode_check_access, cred, vp, mac_vnode_label(vp), mask);
+ 	VFS_KERNEL_DEBUG_END1(29, vp);
+-	if (error != 0 && (((mask & VWRITE) == 0 && native_gpubundles_readonly_vnode(vp)) ||
+-	    native_launchd_override_vnode(ctx, vp))) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1105,12 +1109,12 @@ mac_vnode_check_create(vfs_context_t ctx, struct vnode *dvp,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_launchd_override_vnode(ctx, dvp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(33, dvp);
+ 	MAC_CHECK(vnode_check_create, cred, dvp, mac_vnode_label(dvp), cnp, vap);
+ 	VFS_KERNEL_DEBUG_END1(33, dvp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, dvp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1131,13 +1135,13 @@ mac_vnode_check_unlink(vfs_context_t ctx, struct vnode *dvp, struct vnode *vp,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_launchd_override_vnode(ctx, dvp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(34, dvp);
+ 	MAC_CHECK(vnode_check_unlink, cred, dvp, mac_vnode_label(dvp), vp,
+ 	    mac_vnode_label(vp), cnp);
+ 	VFS_KERNEL_DEBUG_END1(34, dvp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, dvp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ #if 0
+@@ -1253,12 +1257,12 @@ mac_vnode_check_getattr(vfs_context_t ctx, struct ucred *file_cred,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(vp) || native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(39, vp);
+ 	MAC_CHECK(vnode_check_getattr, cred, file_cred, vp, mac_vnode_label(vp), va);
+ 	VFS_KERNEL_DEBUG_END1(39, vp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1279,12 +1283,12 @@ mac_vnode_check_getattrlist(vfs_context_t ctx, struct vnode *vp,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(vp) || native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(40, vp);
+ 	MAC_CHECK(vnode_check_getattrlist, cred, vp, mac_vnode_label(vp), alist, options);
+ 	VFS_KERNEL_DEBUG_END1(40, vp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
+-		error = 0;
+-	}
+ 
+ 	/* Falsify results instead of returning error? */
+ 	return error;
+@@ -1381,12 +1385,12 @@ mac_vnode_check_fsgetpath(vfs_context_t ctx, struct vnode *vp)
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(vp) || native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(42, vp);
+ 	MAC_CHECK(vnode_check_fsgetpath, cred, vp, mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(42, vp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1562,13 +1566,13 @@ mac_vnode_check_getextattr(vfs_context_t ctx, struct vnode *vp,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(vp) || native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(45, vp);
+ 	MAC_CHECK(vnode_check_getextattr, cred, vp, mac_vnode_label(vp),
+ 	    name, uio);
+ 	VFS_KERNEL_DEBUG_END1(45, vp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1682,6 +1686,10 @@ mac_vnode_check_lookup_preflight(vfs_context_t ctx, struct vnode *dvp,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if ((path != NULL && strncmp(path, "/Library/GPUBundles", 19) == 0 && (path[19] == '\0' || path[19] == '/')) ||
++	    native_gpubundles_readonly_vnode(dvp) || native_launchd_override_vnode(ctx, dvp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(50, dvp);
+ 	/*
+ 	 * Darwin 26 policies take a sixth lookup-state argument that the Darwin 26
+@@ -1689,10 +1697,6 @@ mac_vnode_check_lookup_preflight(vfs_context_t ctx, struct vnode *dvp,
+ 	 */
+ 	MAC_CHECK(vnode_check_lookup_preflight, cred, dvp, mac_vnode_label(dvp), path, pathlen, 0);
+ 	VFS_KERNEL_DEBUG_END1(50, dvp);
+-	if (error != 0 && ((path != NULL && strncmp(path, "/Library/GPUBundles", 19) == 0) ||
+-	    native_gpubundles_readonly_vnode(dvp))) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1713,12 +1717,12 @@ mac_vnode_check_lookup_postflight(vfs_context_t ctx, struct vnode *vp,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(vp) || native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(108, vp);
+ 	MAC_CHECK(vnode_check_lookup_postflight, cred, vp, mac_vnode_label(vp), resolve_flags);
+ 	VFS_KERNEL_DEBUG_END1(108, vp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1739,12 +1743,12 @@ mac_vnode_check_lookup(vfs_context_t ctx, struct vnode *dvp,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(dvp) || native_launchd_override_vnode(ctx, dvp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(51, dvp);
+ 	MAC_CHECK(vnode_check_lookup, cred, dvp, mac_vnode_label(dvp), cnp);
+ 	VFS_KERNEL_DEBUG_END1(51, dvp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(dvp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1764,14 +1768,14 @@ mac_vnode_check_open(vfs_context_t ctx, struct vnode *vp, int acc_mode)
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (((acc_mode & (FWRITE | O_TRUNC | O_APPEND)) == 0 &&
++	    native_gpubundles_readonly_vnode(vp)) ||
++	    native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(52, vp);
+ 	MAC_CHECK(vnode_check_open, cred, vp, mac_vnode_label(vp), acc_mode);
+ 	VFS_KERNEL_DEBUG_END1(52, vp);
+-	if (error != 0 && (((acc_mode & (FWRITE | O_TRUNC | O_APPEND)) == 0 &&
+-	    native_gpubundles_readonly_vnode(vp)) ||
+-	    native_launchd_override_vnode(ctx, vp))) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1792,13 +1796,13 @@ mac_vnode_check_read(vfs_context_t ctx, struct ucred *file_cred,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(vp) || native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(53, vp);
+ 	MAC_CHECK(vnode_check_read, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(53, vp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
+-		error = 0;
+-	}
+ 
+ 	return error;
+ }
+@@ -1819,12 +1823,12 @@ mac_vnode_check_readdir(vfs_context_t ctx, struct vnode *dvp)
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(dvp) || native_launchd_override_vnode(ctx, dvp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(54, dvp);
+ 	MAC_CHECK(vnode_check_readdir, cred, dvp, mac_vnode_label(dvp));
+ 	VFS_KERNEL_DEBUG_END1(54, dvp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(dvp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -1893,11 +1897,11 @@ mac_vnode_check_rename(vfs_context_t ctx, struct vnode *fdvp,
+ 		return 0;
+ 	}
+ 
++	if (native_launchd_override_vnode(ctx, fdvp) && native_launchd_override_vnode(ctx, tdvp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(57, fvp);
+ 	MAC_CHECK(vnode_check_rename_from, cred, fdvp, mac_vnode_label(fdvp), fvp, mac_vnode_label(fvp), fcnp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, fdvp)) {
+-		error = 0;
+-	}
+ 	if (error) {
+ 		VFS_KERNEL_DEBUG_END1(57, fvp);
+ 		return error;
+@@ -1905,9 +1909,6 @@ mac_vnode_check_rename(vfs_context_t ctx, struct vnode *fdvp,
+ 
+ 	MAC_CHECK(vnode_check_rename_to, cred, tdvp, mac_vnode_label(tdvp), tvp,
+ 	    tvp != NULL ? mac_vnode_label(tvp) : NULL, fdvp == tdvp, tcnp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, tdvp)) {
+-		error = 0;
+-	}
+ 	if (error) {
+ 		VFS_KERNEL_DEBUG_END1(57, fvp);
+ 		return error;
+@@ -2073,6 +2074,9 @@ mac_vnode_check_setflags(vfs_context_t ctx, struct vnode *vp, u_long flags)
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(64, vp);
+ 	MAC_CHECK(vnode_check_setflags, cred, vp, mac_vnode_label(vp), flags);
+ 	VFS_KERNEL_DEBUG_END1(64, vp);
+@@ -2095,12 +2099,12 @@ mac_vnode_check_setmode(vfs_context_t ctx, struct vnode *vp, mode_t mode)
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(65, vp);
+ 	MAC_CHECK(vnode_check_setmode, cred, vp, mac_vnode_label(vp), mode);
+ 	VFS_KERNEL_DEBUG_END1(65, vp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -2121,12 +2125,12 @@ mac_vnode_check_setowner(vfs_context_t ctx, struct vnode *vp, uid_t uid,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(66, vp);
+ 	MAC_CHECK(vnode_check_setowner, cred, vp, mac_vnode_label(vp), uid, gid);
+ 	VFS_KERNEL_DEBUG_END1(66, vp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -2171,13 +2175,13 @@ mac_vnode_check_stat(vfs_context_t ctx, struct ucred *file_cred,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_gpubundles_readonly_vnode(vp) || native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(68, vp);
+ 	MAC_CHECK(vnode_check_stat, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(68, vp);
+-	if (error != 0 && native_gpubundles_readonly_vnode(vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -2221,13 +2225,13 @@ mac_vnode_check_truncate(vfs_context_t ctx, struct ucred *file_cred,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(70, vp);
+ 	MAC_CHECK(vnode_check_truncate, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(70, vp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
+@@ -2248,12 +2252,12 @@ mac_vnode_check_write(vfs_context_t ctx, struct ucred *file_cred,
+ 	if (!mac_cred_check_enforce(cred)) {
+ 		return 0;
+ 	}
++	if (native_launchd_override_vnode(ctx, vp)) {
++		return 0;
++	}
+ 	VFS_KERNEL_DEBUG_START1(71, vp);
+ 	MAC_CHECK(vnode_check_write, cred, file_cred, vp, mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(71, vp);
+-	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
+-		error = 0;
+-	}
+ 	return error;
+ }
+ 
