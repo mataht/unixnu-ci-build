@@ -1,0 +1,135 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 7c763b5..b667197 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -958,6 +958,7 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+    }
+ 
+    uint32_t gem_handle = (uint32_t)handle;
++   u_rwlock_wrlock(&dev->dma_bo_lock);
+    struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
+    assert(bo && bo->gem_handle == 0);
+ 
+@@ -988,6 +989,7 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+ 
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
++   u_rwlock_wrunlock(&dev->dma_bo_lock);
+ 
+    *out_bo = bo;
+    if (flags & TU_BO_ALLOC_INTERNAL_RESOURCE) {
+@@ -1027,6 +1029,7 @@ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer,
+    }
+ 
+    uint32_t gem_handle = (uint32_t)reply.handle;
++   u_rwlock_wrlock(&dev->dma_bo_lock);
+    struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
+    assert(bo && bo->gem_handle == 0);
+    *bo = (struct tu_bo) {
+@@ -1043,6 +1046,7 @@ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer,
+    bo->never_unmap = true;
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
++   u_rwlock_wrunlock(&dev->dma_bo_lock);
+    *out_bo = bo;
+    return VK_SUCCESS;
+ }
+@@ -1139,22 +1143,44 @@ darwin_wait_idle(struct tu_device *dev)
+ static void
+ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ {
+-   assert(bo->gem_handle);
++   if (!bo)
++      return;
+ 
+-   u_rwlock_rdlock(&dev->dma_bo_lock);
++   u_rwlock_wrlock(&dev->dma_bo_lock);
+ 
+    if (!p_atomic_dec_zero(&bo->refcnt)) {
+-      u_rwlock_rdunlock(&dev->dma_bo_lock);
++      u_rwlock_wrunlock(&dev->dma_bo_lock);
++      return;
++   }
++
++   const uint64_t handle = bo->darwin_handle;
++   const uint64_t iova = bo->iova;
++   const uint64_t retired_size = bo->darwin_alloc_size ? bo->darwin_alloc_size : bo->size;
++   void *const mapping = bo->map;
++   const uint32_t token = bo->darwin_token;
++   const bool cacheable = bo->darwin_alloc_size != 0;
++   const bool read_only = bo->darwin_read_only;
++
++   if (!bo->gem_handle || !handle) {
++      memset(bo, 0, sizeof(*bo));
++      u_rwlock_wrunlock(&dev->dma_bo_lock);
+       return;
+    }
+ 
+    tu_debug_bos_del(dev, bo);
+    tu_dump_bo_del(dev, bo);
+ 
+-   if (bo->map && bo->darwin_token)
++   if (mapping && token)
+       TU_RMV(bo_unmap, dev, bo);
+    TU_RMV(bo_destroy, dev, bo);
+ 
++   /* Zero the sparse-array slot under exclusive dma_bo_lock BEFORE publishing handle to
++    * retire->entries / retire->cache / BoFree, so a concurrent thread reusing the same
++    * handle can never have its live struct tu_bo wiped. */
++   memset(bo, 0, sizeof(*bo));
++
++   u_rwlock_wrunlock(&dev->dma_bo_lock);
++
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+    darwin_reap_locked(dev, retire);
+@@ -1176,8 +1202,8 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       uint32_t fence = dw.last_fence;
+       pthread_mutex_unlock(&dw.lock);
+       unsigned slot = (retire->head + retire->count) % retire->capacity;
+-      retire->entries[slot] = {bo->darwin_handle, bo->iova, bo->darwin_alloc_size ? bo->darwin_alloc_size : bo->size, bo->map,
+-                               bo->darwin_token, fence, bo->darwin_alloc_size != 0, bo->darwin_read_only,
++      retire->entries[slot] = {handle, iova, retired_size, mapping,
++                               token, fence, cacheable, read_only,
+                                retire->active_submits != 0};
+       ++retire->count;
+       ++retire->enqueued;
+@@ -1188,11 +1214,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       retire->failure = vk_device_set_lost(&dev->vk, "deferred BO queue cannot grow; retaining native allocation");
+    }
+    pthread_mutex_unlock(&retire->lock);
+-
+-   /* The BO structs live in a sparse array: zero the entry to mark it free. */
+-   memset(bo, 0, sizeof(*bo));
+-
+-   u_rwlock_rdunlock(&dev->dma_bo_lock);
+ }
+ 
+ /* ---- submissions ---- */
+@@ -1274,15 +1295,23 @@ static void
+ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+                           struct tu_cs_entry *entries, unsigned num_entries)
+ {
+-   (void)device;
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   const uint64_t va_start = device->physical_device->va_start;
+    for (unsigned i = 0; i < num_entries; i++) {
+       struct tu_bo *bo = const_cast<struct tu_bo *>(entries[i].bo);
+       if (!bo || entries[i].size == 0 || (entries[i].size & 3))
+          continue;
++      const uint64_t handle = bo->darwin_handle;
++      const uint64_t iova = bo->iova + entries[i].offset;
++      if (!handle || iova < va_start) {
++         mesa_loge("darwin: invalid CS entry i=%u/%u h=%llx iova=%llx off=%u bytes=%u",
++                   i, num_entries, (unsigned long long)handle, (unsigned long long)iova,
++                   entries[i].offset, entries[i].size);
++         continue;
++      }
+       NativeAdrenoAbiSubmitBuffer cmd = {
+-         .handle = bo->darwin_handle,
+-         .iova = bo->iova + entries[i].offset,
++         .handle = handle,
++         .iova = iova,
+          .bytes = entries[i].size,
+       };
+       p_atomic_inc(&bo->refcnt);

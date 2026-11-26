@@ -1,0 +1,249 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 6b0c57b..c7ddca4 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -737,7 +737,7 @@ bsd_init(void)
+ 		limit0.pl_rlimit[i].rlim_cur =
+ 		    limit0.pl_rlimit[i].rlim_max = RLIM_INFINITY;
+ 	}
+-	limit0.pl_rlimit[RLIMIT_NOFILE].rlim_cur = NOFILE;
++	limit0.pl_rlimit[RLIMIT_NOFILE].rlim_cur = 4096;
+ 	limit0.pl_rlimit[RLIMIT_NPROC].rlim_cur = maxprocperuid;
+ 	limit0.pl_rlimit[RLIMIT_NPROC].rlim_max = maxproc;
+ 	limit0.pl_rlimit[RLIMIT_STACK] = vm_initial_limit_stack;
+diff --git a/bsd/kern/hvg_sysctl.c b/bsd/kern/hvg_sysctl.c
+index 2a206b9..ec9da55 100644
+--- a/bsd/kern/hvg_sysctl.c
++++ b/bsd/kern/hvg_sysctl.c
+@@ -145,7 +145,10 @@ sysctl_vmm_present(__unused struct sysctl_oid *oidp,
+ 	if (vmm_present) {
+ 		char procname[17] = {};
+ 		proc_selfname(procname, sizeof(procname));
+-		if (strcmp(procname, "corebrightnessd") == 0) {
++		if (strcmp(procname, "corebrightnessd") == 0 ||
++		    strcmp(procname, "wifip2pd") == 0 ||
++		    strcmp(procname, "airportd") == 0 ||
++		    strcmp(procname, "sharingd") == 0) {
+ 			vmm_present = 0;
+ 		}
+ 	}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index cff8e74..285cb55 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7614,7 +7614,7 @@ static TUNABLE_STR(native_deny_exec, 2048, "deny-exec",
+     "modelcatalogd,mediaanalysisd,photoanalysisd,spindump,tailspind,ReportMemoryException,"
+     "duetexpertd,intelligenceflowd,intelligenceplatformd,intelligencecontextd,intelligencetasksd,"
+     "spotlightknowledged,spotlightknowledged.importer,spotlightknowledged.updater,"
+-    "siriknowledged,siriinferenced,knowledge-agent,PerfPowerServices,PerfPowerServicesExtended,coreduetd,BackgroundShortcutRunner,STExtractionService.privileged,softwareupdated,mobileassetd,Install-in-Progress,amsengagementd");
++    "siriknowledged,siriinferenced,knowledge-agent,PerfPowerServices,PerfPowerServicesExtended,coreduetd,BackgroundShortcutRunner,STExtractionService.privileged,softwareupdated,mobileassetd,Install-in-Progress,amsengagementd,SoftwareUpdateNotificationManager,assetsubscriptiond");
+ static bool
+ native_exec_denied(struct vnode *vp)
+ {
+diff --git a/bsd/kern/kern_newsysctl.c b/bsd/kern/kern_newsysctl.c
+index adeb882..aec3931 100644
+--- a/bsd/kern/kern_newsysctl.c
++++ b/bsd/kern/kern_newsysctl.c
+@@ -1970,7 +1970,8 @@ found:
+ 	    strncmp(namestring, "hw.activecpu", 12) == 0 || strncmp(namestring, "hw.logicalcpu", 13) == 0 ||
+ 	    strncmp(namestring, "hw.physicalcpu", 14) == 0 || strncmp(namestring, "hw.cachelinesize", 16) == 0 ||
+ 	    strncmp(namestring, "hw.cpufamily", 12) == 0 || strncmp(namestring, "hw.tbfrequency", 14) == 0)));
+-	if (!from_kernel && !hw_geom_read) {
++	const bool footprint_suspend_allow = namestring != NULL && strcmp(namestring, "vm.footprint_suspend") == 0;
++	if (!from_kernel && !hw_geom_read && !footprint_suspend_allow) {
+ 		error = mac_system_check_sysctlbyname(kauth_cred_get(),
+ 		    namestring,
+ 		    name,
+diff --git a/bsd/netinet/tcp_log.c b/bsd/netinet/tcp_log.c
+index ae57569..405868e 100644
+--- a/bsd/netinet/tcp_log.c
++++ b/bsd/netinet/tcp_log.c
+@@ -56,7 +56,7 @@ SYSCTL_NODE(_net_inet_tcp, OID_AUTO, log, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     TLEF_DROP_NECP)
+ #endif /* (DEVELOPMENT || DEBUG) */
+ 
+-uint32_t tcp_log_enable_flags = TCP_LOG_ENABLE_DEFAULT;
++uint32_t tcp_log_enable_flags = 0;
+ SYSCTL_UINT(_net_inet_tcp_log, OID_AUTO, enable,
+     CTLFLAG_RW | CTLFLAG_LOCKED, &tcp_log_enable_flags, 0, "");
+ 
+diff --git a/bsd/netinet/udp_log.c b/bsd/netinet/udp_log.c
+index 256f884..8a7a3a1 100644
+--- a/bsd/netinet/udp_log.c
++++ b/bsd/netinet/udp_log.c
+@@ -53,7 +53,7 @@ SYSCTL_NODE(_net_inet_udp, OID_AUTO, log, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+     (ULEF_CONNECT | ULEF_DST_LOCAL | ULEF_DST_GW)
+ #endif /* (DEVELOPMENT || DEBUG) */
+ 
+-uint32_t udp_log_enable_flags = UDP_LOG_ENABLE_DEFAULT;
++uint32_t udp_log_enable_flags = 0;
+ SYSCTL_UINT(_net_inet_udp_log, OID_AUTO, enable,
+     CTLFLAG_RW | CTLFLAG_LOCKED, &udp_log_enable_flags, 0, "");
+ 
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index 451f335..6ca37de 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -1875,7 +1875,7 @@ vm_shared_region_map_file_setup(
+ 				 * sub map, to log any unexpected unnesting below
+ 				 * that address (see log_unnest_badness()).
+ 				 */
+-				if ((mappings[i].sms_init_prot & VM_PROT_WRITE) &&
++				if (((mappings[i].sms_init_prot | mappings[i].sms_max_prot) & VM_PROT_WRITE) &&
+ 				    sr_map->is_nested_map &&
+ 				    (lowest_unnestable_addr == 0 ||
+ 				    (target_address < lowest_unnestable_addr))) {
+diff --git a/security/mac_vfs.c b/security/mac_vfs.c
+index aaeed77..c62bcd8 100644
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -952,12 +952,39 @@ native_gpubundles_readonly_vnode(struct vnode *vp)
+ 	if (vn_getpath(vp, gp_path, &gp_len) != 0) {
+ 		return 0;
+ 	}
+-	if (strncmp(gp_path, "/Library/GPUBundles/NativeAdrenoMetal.",
+-	    sizeof("/Library/GPUBundles/NativeAdrenoMetal.") - 1) == 0 ||
+-	    strncmp(gp_path, "/System/Volumes/Data/Library/GPUBundles/NativeAdrenoMetal.",
+-	    sizeof("/System/Volumes/Data/Library/GPUBundles/NativeAdrenoMetal.") - 1) == 0 ||
++	if (strncmp(gp_path, "/Library/GPUBundles/", sizeof("/Library/GPUBundles/") - 1) == 0 ||
++	    strncmp(gp_path, "/System/Volumes/Data/Library/GPUBundles/", sizeof("/System/Volumes/Data/Library/GPUBundles/") - 1) == 0 ||
++	    strncmp(gp_path, "/private/var/ngpu/GPUBundles/", sizeof("/private/var/ngpu/GPUBundles/") - 1) == 0 ||
++	    strncmp(gp_path, "/private/var/tmp/NativeAdrenoMetal.cache/", sizeof("/private/var/tmp/NativeAdrenoMetal.cache/") - 1) == 0 ||
++	    strncmp(gp_path, "/System/Volumes/Data/private/var/tmp/NativeAdrenoMetal.cache/", sizeof("/System/Volumes/Data/private/var/tmp/NativeAdrenoMetal.cache/") - 1) == 0 ||
+ 	    strcmp(gp_path, "/Library/GPUBundles") == 0 ||
+-	    strcmp(gp_path, "/System/Volumes/Data/Library/GPUBundles") == 0) {
++	    strcmp(gp_path, "/System/Volumes/Data/Library/GPUBundles") == 0 ||
++	    strcmp(gp_path, "/private/var/ngpu/GPUBundles") == 0 ||
++	    strcmp(gp_path, "/private/var/tmp/NativeAdrenoMetal.cache") == 0 ||
++	    strcmp(gp_path, "/System/Volumes/Data/private/var/tmp/NativeAdrenoMetal.cache") == 0) {
++		return 1;
++	}
++	return 0;
++}
++
++static int
++native_launchd_override_vnode(vfs_context_t ctx, struct vnode *vp)
++{
++	char lp_path[256];
++	int lp_len = (int)sizeof(lp_path);
++
++	if (ctx == NULL || vp == NULL || vfs_context_pid(ctx) != 1) {
++		return 0;
++	}
++	if (vn_getpath(vp, lp_path, &lp_len) != 0) {
++		return 0;
++	}
++	if (strncmp(lp_path, "/private/var/db/com.apple.xpc.launchd/",
++	    sizeof("/private/var/db/com.apple.xpc.launchd/") - 1) == 0 ||
++	    strcmp(lp_path, "/private/var/db/com.apple.xpc.launchd") == 0 ||
++	    strncmp(lp_path, "/System/Volumes/Data/private/var/db/com.apple.xpc.launchd/",
++	    sizeof("/System/Volumes/Data/private/var/db/com.apple.xpc.launchd/") - 1) == 0 ||
++	    strcmp(lp_path, "/System/Volumes/Data/private/var/db/com.apple.xpc.launchd") == 0) {
+ 		return 1;
+ 	}
+ 	return 0;
+@@ -986,8 +1013,8 @@ mac_vnode_check_access(vfs_context_t ctx, struct vnode *vp,
+ 	VFS_KERNEL_DEBUG_START1(29, vp);
+ 	MAC_CHECK(vnode_check_access, cred, vp, mac_vnode_label(vp), mask);
+ 	VFS_KERNEL_DEBUG_END1(29, vp);
+-	if (error != 0 && (mask & VWRITE) == 0 &&
+-	    native_gpubundles_readonly_vnode(vp)) {
++	if (error != 0 && (((mask & VWRITE) == 0 && native_gpubundles_readonly_vnode(vp)) ||
++	    native_launchd_override_vnode(ctx, vp))) {
+ 		error = 0;
+ 	}
+ 	return error;
+@@ -1081,6 +1108,9 @@ mac_vnode_check_create(vfs_context_t ctx, struct vnode *dvp,
+ 	VFS_KERNEL_DEBUG_START1(33, dvp);
+ 	MAC_CHECK(vnode_check_create, cred, dvp, mac_vnode_label(dvp), cnp, vap);
+ 	VFS_KERNEL_DEBUG_END1(33, dvp);
++	if (error != 0 && native_launchd_override_vnode(ctx, dvp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -1105,6 +1135,9 @@ mac_vnode_check_unlink(vfs_context_t ctx, struct vnode *dvp, struct vnode *vp,
+ 	MAC_CHECK(vnode_check_unlink, cred, dvp, mac_vnode_label(dvp), vp,
+ 	    mac_vnode_label(vp), cnp);
+ 	VFS_KERNEL_DEBUG_END1(34, dvp);
++	if (error != 0 && native_launchd_override_vnode(ctx, dvp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ #if 0
+@@ -1734,8 +1767,9 @@ mac_vnode_check_open(vfs_context_t ctx, struct vnode *vp, int acc_mode)
+ 	VFS_KERNEL_DEBUG_START1(52, vp);
+ 	MAC_CHECK(vnode_check_open, cred, vp, mac_vnode_label(vp), acc_mode);
+ 	VFS_KERNEL_DEBUG_END1(52, vp);
+-	if (error != 0 && (acc_mode & (FWRITE | O_TRUNC | O_APPEND)) == 0 &&
+-	    native_gpubundles_readonly_vnode(vp)) {
++	if (error != 0 && (((acc_mode & (FWRITE | O_TRUNC | O_APPEND)) == 0 &&
++	    native_gpubundles_readonly_vnode(vp)) ||
++	    native_launchd_override_vnode(ctx, vp))) {
+ 		error = 0;
+ 	}
+ 	return error;
+@@ -1861,6 +1895,9 @@ mac_vnode_check_rename(vfs_context_t ctx, struct vnode *fdvp,
+ 
+ 	VFS_KERNEL_DEBUG_START1(57, fvp);
+ 	MAC_CHECK(vnode_check_rename_from, cred, fdvp, mac_vnode_label(fdvp), fvp, mac_vnode_label(fvp), fcnp);
++	if (error != 0 && native_launchd_override_vnode(ctx, fdvp)) {
++		error = 0;
++	}
+ 	if (error) {
+ 		VFS_KERNEL_DEBUG_END1(57, fvp);
+ 		return error;
+@@ -1868,6 +1905,9 @@ mac_vnode_check_rename(vfs_context_t ctx, struct vnode *fdvp,
+ 
+ 	MAC_CHECK(vnode_check_rename_to, cred, tdvp, mac_vnode_label(tdvp), tvp,
+ 	    tvp != NULL ? mac_vnode_label(tvp) : NULL, fdvp == tdvp, tcnp);
++	if (error != 0 && native_launchd_override_vnode(ctx, tdvp)) {
++		error = 0;
++	}
+ 	if (error) {
+ 		VFS_KERNEL_DEBUG_END1(57, fvp);
+ 		return error;
+@@ -2058,6 +2098,9 @@ mac_vnode_check_setmode(vfs_context_t ctx, struct vnode *vp, mode_t mode)
+ 	VFS_KERNEL_DEBUG_START1(65, vp);
+ 	MAC_CHECK(vnode_check_setmode, cred, vp, mac_vnode_label(vp), mode);
+ 	VFS_KERNEL_DEBUG_END1(65, vp);
++	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -2081,6 +2124,9 @@ mac_vnode_check_setowner(vfs_context_t ctx, struct vnode *vp, uid_t uid,
+ 	VFS_KERNEL_DEBUG_START1(66, vp);
+ 	MAC_CHECK(vnode_check_setowner, cred, vp, mac_vnode_label(vp), uid, gid);
+ 	VFS_KERNEL_DEBUG_END1(66, vp);
++	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -2179,7 +2225,9 @@ mac_vnode_check_truncate(vfs_context_t ctx, struct ucred *file_cred,
+ 	MAC_CHECK(vnode_check_truncate, cred, file_cred, vp,
+ 	    mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(70, vp);
+-
++	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 
+@@ -2203,7 +2251,9 @@ mac_vnode_check_write(vfs_context_t ctx, struct ucred *file_cred,
+ 	VFS_KERNEL_DEBUG_START1(71, vp);
+ 	MAC_CHECK(vnode_check_write, cred, file_cred, vp, mac_vnode_label(vp));
+ 	VFS_KERNEL_DEBUG_END1(71, vp);
+-
++	if (error != 0 && native_launchd_override_vnode(ctx, vp)) {
++		error = 0;
++	}
+ 	return error;
+ }
+ 

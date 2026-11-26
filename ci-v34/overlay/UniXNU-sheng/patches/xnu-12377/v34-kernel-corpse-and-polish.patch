@@ -1,0 +1,20 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index 4754f13..d87de3e 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -7274,6 +7274,15 @@ task_set_jetsam_realtime_audio(task_t task, bool realtime_audio)
+ void __attribute__((noinline))
+ PROC_CROSSED_HIGH_WATERMARK__SEND_EXC_RESOURCE_AND_SUSPEND(int max_footprint_mb, send_exec_resource_options_t exception_options)
+ {
++	/*
++	 * ReportMemoryException / spindump / tailspind are disabled on this board;
++	 * cloning a 200+ MB task VM map into a Full corpse on non-fatal ActiveSoft /
++	 * InactiveSoft crossings only stalls the caller ~300 ms while memorystatus
++	 * already handles the soft limit directly.
++	 */
++	if ((exception_options & EXC_RESOURCE_FATAL) == 0) {
++		return;
++	}
+ 	task_t                                          task            = current_task();
+ 	int                                                     pid         = 0;
+ 	const char                                      *procname       = "unknown";
